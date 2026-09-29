@@ -29,6 +29,38 @@
 # ===========================================================================
 
 sql_generation_examples:
+# --- 2026-09-28 PMAY-G use-case QA (KI-089, KI-092, KI-093): one row per named area,
+# ratio of totals, no LIMIT 1 on a comparison. Executed against megh_db.
+- question: Give me the PMAY financial summary for Mawphlang block.
+  sql: |
+    SELECT COUNT(*) AS houses,
+           SUM(sanctioned_amount) AS sanctioned_rupees,
+           SUM(COALESCE(amount_released, 0)) AS released_rupees,
+           SUM(sanctioned_amount) - SUM(COALESCE(amount_released, 0)) AS remaining_rupees
+    FROM curated.v_pmay
+    WHERE NOT is_placeholder
+      AND lgd_block = 'MAWPHLANG';
+  tables:
+  - curated.v_pmay
+- question: What percentage of the sanctioned amount has been released in East Khasi Hills?
+  sql: |
+    SELECT ROUND(100.0 * SUM(COALESCE(amount_released, 0)) / NULLIF(SUM(sanctioned_amount), 0), 2) AS released_pct
+    FROM curated.v_pmay
+    WHERE NOT is_placeholder
+      AND sanctioned_amount > 0
+      AND lgd_district = 'EAST KHASI HILLS';
+  tables:
+  - curated.v_pmay
+- question: Compare the sanctioned amounts of Umsning and Amlarem blocks.
+  sql: |
+    SELECT lgd_block, COUNT(*) AS houses, SUM(sanctioned_amount) AS sanctioned_rupees
+    FROM curated.v_pmay
+    WHERE NOT is_placeholder
+      AND lgd_block IN ('UMSNING', 'AMLAREM')
+    GROUP BY lgd_block
+    ORDER BY sanctioned_rupees DESC;
+  tables:
+  - curated.v_pmay
 - question: How many PMAY houses are there?
   sql: |
     SELECT COUNT(*) AS houses

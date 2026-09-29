@@ -16,9 +16,9 @@ Tracing MGNREGA's flow and comparing, layer by layer:
      resolved["assembly_constituency"] was never set, the filter was silently
      dropped, and the pipeline fell through to the geography branches — which
      ask for a district. That is the reported symptom.
-  4. constituency_contents            reads curated.v_employment (MGNREGA-only),
-     so Focus Legacy gets no drill-down chips. Acceptable: the caller already
-     treats empty as "offer nothing" and proceeds with the whole constituency.
+  4. constituency_contents            read curated.v_employment (MGNREGA-only)
+     for every scheme. Since KI-146 (2026-09-29) it reads the asking scheme's
+     own rows (v_focus_legacy JOIN dim_geography for Focus Legacy).
   5. prompt_builder resolved-entity line             ** BROKEN **
      Emitted `UPPER(assembly_constituency_name) = ...`, a column that exists
      only on mgnrega_employment. v_focus_legacy has none — it reaches ac_name

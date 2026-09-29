@@ -285,6 +285,15 @@ MGNREGA RULES (breaking these produces a wrong number, not just an ugly query):
      if computing it inline, SUM(total_exp) * 100000 / NULLIF(SUM(person_days), 0) — total_exp
      is LAKH and person_days is a raw count. NEVER divide the crore figure (total_exp / 100)
      by person_days: that is ~0.00004 and rounds to 0 for every row.
+  8. Every employment measure is an INTEGER, and integer / integer truncates: person-days per
+     household must be SUM(person_days)::numeric / NULLIF(SUM(households_employed), 0)
+     (38.16, not 38). Cast the numerator of every ratio or average to numeric.
+  9. "Which villages …" returns village NAMES: SELECT lgd_village_name, village_code,
+     SUM(<metric>) … GROUP BY lgd_village_name, village_code ORDER BY 3 DESC. For "which
+     villages received employment" add HAVING SUM(persons_employed) > 0 — villages with a
+     zero row did not receive employment.
+ 10. A comparison ("more on wages or materials?", "X vs Y") returns BOTH figures as numeric
+     columns, never only a CASE label: wages = SUM(unskilled_wage_exp + semi_skilled_wage_exp).
 """.strip()
 
 _MGNREGA_VOCAB = """
@@ -341,6 +350,18 @@ PMAY-G RULES (breaking these produces a wrong number, not just an ugly query):
      columns directly. Do NOT use curated.v_pmay_monthly_sanctions for these; it has no
      geography column. For "share concentrated in the top N districts", aggregate the metric
      per district in a CTE, then divide the top-N subtotal by the grand total.
+  7. A "financial summary", "performance" or "compare A and B" question with no year-wise /
+     trend wording returns ONE row per area named (one row for one area) — never GROUP BY
+     financial_year / year_key / sanction_date. Return sanctioned, released and
+     remaining (SUM(sanctioned_amount) - SUM(COALESCE(amount_released, 0))) in RUPEES,
+     unrounded; the answer states each (2026-09-28 QA: a per-year GROUP BY reported a sum of
+     rounded yearly crore as the total and dropped the released and remaining amounts).
+  8. Utilisation / "% of the sanctioned amount released" is ONE ratio of totals:
+     100.0 * SUM(COALESCE(amount_released, 0)) / NULLIF(SUM(sanctioned_amount), 0). Never AVG()
+     of amount_released or of per-house ratios. amount_released is NULL on 336 houses that
+     have received nothing — COALESCE it to 0 in every count or sum of releases.
+  9. Comparing named areas ("which has more: A or B", "compare A and B") returns a row for
+     EACH area — never LIMIT 1 — and the answer names both figures and the difference.
 """.strip()
 
 _PMAY_VOCAB = """
@@ -641,7 +662,9 @@ CM ELEVATE RULES (breaking these produces a wrong number, not just an ugly query
      real keys, verified live against megh_db, all holding TEXT despite the `_id`
      suffix: gender_id (all 15 schemes), sector_id (Poultry, Dairy, Goat only —
      'Poultry'/'Piggery'/etc., mostly NULL), occupation_id (uncoded, no lookup
-     table). For any OTHER scheme_specific field the question names, either match it
+     table), file_status (all 15 schemes, every row: 'Pending' 8,472 / 'Send Back'
+     90 / 'Rejected' 64 / 'Approved' 1 — the application's decision state,
+     verified live 2026-09-27). For any OTHER scheme_specific field the question names, either match it
      to a key already confirmed in this prompt, or run
      `SELECT DISTINCT jsonb_object_keys(scheme_specific)` scoped to that one scheme
      first and use exactly what comes back — never a plausible-sounding shortened or
@@ -721,19 +744,18 @@ CM ELEVATE RULES (breaking these produces a wrong number, not just an ugly query
      schemes here, not 13, and PRIME Small Enterprise Empowerment (the LARGEST scheme
      at ~43% of applications) is entirely absent from that workbook's list.
  13. UNQUALIFIED "status" / "status distribution" / "status-wise" / "current status" /
-     "application status" — with NO other qualifier — ALWAYS means data_verified. The
-     word "current" in the question does NOT mean current_file_status; that column
-     only applies when the question explicitly says "file status", "workflow
-     status/breakdown", or "where the file is" (current_level only for "level" or
-     "stage"). data_verified's only real stored values, EVER: 'Valid', 'On Hold',
-     'Invalid', 'Wrong', or NULL (no verdict recorded) — never invent any other
-     literal (e.g. 'Completed', 'Verified', 'Pending', 'Approved' do not exist in this
-     column). A "status-wise" / "status distribution" / "status breakdown" question
-     is a GROUP BY over ALL of these values (COALESCE NULL to '(not recorded)'), never
-     a single filtered COUNT for just one value. If current_file_status genuinely is
-     the right column (per the qualifiers above), LOWER() it and merge 'sendback' with
-     'sendback to vdv/citizen' via a LIKE prefix match (rule 7) — never list them as
-     separate buckets.
+     "application status" / "status breakdown" ALWAYS means current_file_status
+     (product decision 2026-09-28 — NOT data_verified). Its stored values: 'forward',
+     'sendback', 'sendback to vdv/citizen', 'resubmit' (mixed case). Group them with
+     exactly this expression, which merges the two send-back spellings (rule 7):
+       CASE WHEN LOWER(current_file_status) LIKE 'sendback%' THEN 'Sent back'
+            WHEN current_file_status IS NULL THEN '(not recorded)'
+            ELSE INITCAP(LOWER(current_file_status)) END AS status
+     A status question is a GROUP BY over ALL values, never a single filtered COUNT.
+     data_verified stays the column for VERIFICATION words only: "verified" /
+     "verification" / "valid" / "invalid" / "wrong" / "on hold" / "pending" (see
+     rules 3 and 14 and the vocabulary) — its values are 'Valid', 'On Hold',
+     'Invalid', 'Wrong' or NULL.
  14. "verified" / "verification completed" / "completed data verification" ->
      data_verified = 'Valid'. "not verified" / "verification pending" / "incomplete
      verification" -> data_verified IS DISTINCT FROM 'Valid' (covers On Hold, Invalid,
@@ -766,7 +788,9 @@ CM ELEVATE BUSINESS VOCABULARY (source: cmelevate_schema_partitions.yaml + cmele
     "applications" / "records" / "requests" -> COUNT(*)   (an application is a REQUEST, not an award — say "applications")
     "applicants" / "beneficiaries" / "distinct applications" / "unique applications" -> COUNT(DISTINCT request_id)   (request_id is NOT unique — about 36 numbers repeat, all inside Piggery — so a bare COUNT(*) overcounts "applicants"/"beneficiaries" by those duplicates; only "applications"/"requests" itself means the raw row count)
     "on hold" / "pending" / "held" -> data_verified = 'On Hold'   (NEVER the onhold boolean)
-    "approved" / "sanctioned" / "cleared" -> NOT AVAILABLE, no approval field exists   "status" (default) -> data_verified   (current_file_status is 98.4% one value; current_level is 98.6% one value)
+    ONLY when the question itself names a level ("pending at level 2", "pending in level1"): -> LOWER(current_level) = 'levelN' alone — the level IS the scope; do NOT also add data_verified = 'On Hold' (no level-2 application is on hold, so that AND returns a false 0). A plain "pending" with NO level named is still data_verified = 'On Hold' — never a current_level filter
+    "pending in each sector" / "<status> by sector" / "<status> by <dimension>" -> keep the status test INSIDE COUNT(*) FILTER (WHERE data_verified = '...') and GROUP BY the dimension with NO status test in the WHERE, so a group with none still shows 0
+    "approved" / "rejected" / "decision" -> scheme_specific ->> 'file_status' = 'Approved' / 'Rejected' (exact Title Case) — current_file_status NEVER holds approved/rejected/pending (only forward / sendback / resubmit), so filtering it for those returns a false 0   "sanctioned" / "cleared" / "funded" -> NOT AVAILABLE here (sanction lives in CM Elevate Legacy)   "status" / "status distribution" / "status-wise" / "application status" (default) -> current_file_status, send-back spellings merged (rule 13; decided 2026-09-28)   "verification status" -> data_verified
     "villages" -> COUNT(DISTINCT village_code) FILTER (WHERE entity_type <> 'Unresolved')   "districts" / "blocks" -> COUNT(DISTINCT lgd_district) / COUNT(DISTINCT lgd_block)
     "amount" / "money" / "disbursed" / "subsidy" / "loan" / "sanctioned amount" -> NOT AVAILABLE, no money column exists   "gender" -> scheme_specific ->> 'gender_id'
     "type" (default) -> applicant_category   "mode" -> application_mode (online / cmconnectcenter)   "schemes" -> COUNT(*) FROM curated.dim_cm_elevate_scheme  (= 15)

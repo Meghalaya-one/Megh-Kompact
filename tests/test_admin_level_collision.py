@@ -76,7 +76,7 @@ _AC_CONTENTS = {
 }
 
 
-async def _fake_constituency_contents(ac_name):
+async def _fake_constituency_contents(ac_name, scheme=None):
     return _AC_CONTENTS.get(str(ac_name).upper(),
                             {"districts": [], "blocks": [], "villages": 0})
 

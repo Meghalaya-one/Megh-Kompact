@@ -15,7 +15,7 @@ Flow (the NeuralAiGovernanceProject standard, adapted to Qdrant + qwen3):
 import logging
 import re
 
-from app import llm, vectorstore
+from app import context_budget, llm, vectorstore
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -209,6 +209,9 @@ Reference passages:
 {context}
 
 Answer:"""
+        context_budget.log_prompt_context(
+            "compose", [("retrieved_passages", context), ("question", question)],
+            prompt=prompt, route="rag", chunks=len(chunks))
         answer = await llm.call_response_composer(prompt)
         # The composer sometimes answers correctly AND tacks on a stray
         # "that isn't covered..." hedge sentence (about some tangential detail
@@ -295,6 +298,9 @@ Reference passages:
 {context}
 
 Answer:"""
+    context_budget.log_prompt_context(
+        "compose", [("retrieved_passages", context), ("question", question)],
+        prompt=prompt, route="rag_multi", chunks=len(sources))
     answer = await llm.call_response_composer(prompt)
     cleaned = _REFUSAL_SENTENCE.sub("", answer).strip()
     if cleaned and _is_whole_refusal(cleaned):

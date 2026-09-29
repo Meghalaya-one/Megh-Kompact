@@ -2666,6 +2666,8 @@ function buildFollowUp(question, response) {
   if (tableMatches.length) {
     const seen = [];
     for (const m of tableMatches) {
+      // "IS DISTINCT FROM TRUE" is not a table (it showed "Sources: TRUE, PMAY-G", 2026-09-29)
+      if (/^(true|false|null)$/i.test(m[1])) continue;
       const pretty = prettyName(m[1].replace(/["']/g, '').split('.').pop());
       if (pretty && !seen.includes(pretty)) seen.push(pretty);
     }

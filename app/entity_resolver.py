@@ -102,6 +102,14 @@ _HOUSE_STATUS_ALIAS_DENY = {
     "SANCTIONED", "SANCTION", "NOT STARTED", "YET TO START",
     "APPROVED NOT STARTED", "YET TO BEGIN", "NO CONSTRUCTION",
 }
+# Stage phrases carrying these tokens are matched as an in-order phrase only, and
+# never when the next word makes it money (see resolve_house_status, KI-091).
+# Generic words that also occur in village names and ordinary sentences ("Old
+# Bhaitbari … their house is not completed" matched the alias "old house" and the
+# count was filtered to the Existing site(Old House) stage — PMAY-G scenario run
+# 2026-09-28). A phrase containing any of them must appear in order, as a phrase.
+_HS_SANCTION_TOKENS = {"SANCTIONED", "SANCTION", "OLD", "HOUSE", "HOUSES", "SITE", "NEW"}
+_HS_MONEY_NEXT = {"AMOUNT", "AMOUNTS", "MONEY", "FUND", "FUNDS", "RUPEES", "RS", "SUM", "VALUE", "COST"}
 
 
 @dataclass
@@ -273,11 +281,26 @@ def resolve_house_status(question: str, scheme: str = "PMAY-G") -> "Resolved | N
     if not vals and not groups:
         return None
 
-    q_tokens = set(_hs_tokens(question))
+    q_list = _hs_tokens(question)
+    q_tokens = set(q_list)
     if not q_tokens:
         return None
 
     def _phrase_in(tokens: list[str]) -> bool:
+        if any(t in _HS_SANCTION_TOKENS for t in tokens):
+            # "sanctioned" is also a money column and a date filter. A bag-of-tokens
+            # match read "received only part of their SANCTIONED amount" as the alias
+            # "sanctioned only", and "the full SANCTIONED amount but their HOUSE is
+            # not completed" as "House Sanctioned" — the composer then said the count
+            # "applies to the House Sanctioned stage" (PMAY-G use-case QA 2026-09-28,
+            # KI-091). A stage phrase with "sanctioned" must appear in order, as a
+            # phrase, and not as "sanctioned amount / money / funds".
+            n = len(tokens)
+            for i in range(len(q_list) - n + 1):
+                if q_list[i:i + n] == tokens and (
+                        i + n >= len(q_list) or q_list[i + n] not in _HS_MONEY_NEXT):
+                    return True
+            return False
         present = sum(1 for t in tokens if t in q_tokens)
         if present == len(tokens):
             return True
@@ -1166,6 +1189,94 @@ def detect_region(question: str, scheme: str) -> "dict | None":
     }
 
 
+def named_places(text: str) -> dict[str, str]:
+    """Every district and block name that any scheme's catalogue knows and that
+    appears as a whole phrase in `text`, as {CANONICAL UPPER: dimension}.
+    Uses the same name forms as scan_dimension (_scannable_forms, so a 3+
+    letter acronym like "EKH" counts). The longest match wins and uses up its
+    span, so "South West Garo Hills" is one district, not also "West Garo
+    Hills".
+
+    Used by pipeline.rewrite_followup's provenance check, which compares the
+    names in a rewritten follow-up with the names in the text it was allowed to
+    draw from. Both sides go through this one scan, so a name that is also a
+    village or a constituency is counted the same way on both sides and can
+    never cause a mismatch on its own. Villages are DB-backed and not in the
+    catalogue, so they are not checked here."""
+    padded = f" {fold(text or '')} "
+    found: dict[str, str] = {}
+    for ff, pat, canon, dim in _place_patterns():
+        if ff in padded and pat.search(padded):
+            found.setdefault(canon, dim)
+            padded = pat.sub(lambda m: " " * len(m.group(0)), padded)
+    return found
+
+
+_ACRONYM_TOKEN_RE = re.compile(r"\b[A-Za-z]{3,5}\b")
+
+
+def acronym_near_misses(text: str) -> dict[str, list[str]]:
+    """{typed token: [CANONICAL district, ...]} for a token that is not any
+    catalogued name form but has exactly the letters of a catalogued district
+    acronym, in another order — "WHK" for WKH (West Khasi Hills). Reported
+    2026-09-29: "Compare the total disbursement in WHK and EKH" resolved EKH
+    and silently lost WHK (not_found at every stage), so the comparison ran for
+    one district. Nothing is guessed here: the caller asks, offering only the
+    districts whose SME acronym (data/<scheme>/*_entity_resolver.yaml) has those
+    letters. No district acronym's letters spell an English word (they are
+    consonant clusters plus at most one E), so ordinary words never match."""
+    acronyms: dict[str, set[str]] = {}
+    for dims in _catalog.values():
+        for v in dims.get("district") or []:
+            acr = str(v.get("acronym") or "").strip().upper()
+            if len(acr) >= 3 and acr.isalpha():
+                acronyms.setdefault(acr, set()).add(str(v["canonical"]).upper())
+    if not acronyms:
+        return {}
+    known = named_places(text)
+    out: dict[str, list[str]] = {}
+    for m in _ACRONYM_TOKEN_RE.finditer(text or ""):
+        tok = m.group(0).upper()
+        if tok in acronyms or named_places(tok):
+            continue
+        cands = sorted({c for acr, canons in acronyms.items()
+                        if sorted(acr) == sorted(tok) for c in canons})
+        # A candidate the text already names outright is the user's answer
+        # (a typed reply merged into the paused question), not a question.
+        if cands and not any(c in known for c in cands):
+            out[m.group(0)] = cands
+    return out
+
+
+_place_patterns_cache: "tuple[tuple, list] | None" = None
+
+
+def _place_patterns() -> list:
+    """(folded form, compiled whole-phrase pattern, CANONICAL, dimension) for
+    every district/block name form, longest first. Compiled once per loaded
+    catalogue: there are over a thousand forms, more than re's own pattern
+    cache holds, and recompiling them made each follow-up rewrite spend about
+    20 ms of CPU on the event loop."""
+    global _place_patterns_cache
+    key = tuple((s, id(d), len(d.get("district") or []), len(d.get("block") or []))
+                for s, d in _catalog.items())
+    if _place_patterns_cache is not None and _place_patterns_cache[0] == key:
+        return _place_patterns_cache[1]
+    forms: list[tuple[str, str, str]] = []
+    for dims in _catalog.values():
+        for dim in ("district", "block"):
+            for v in dims.get(dim) or []:
+                for form in _scannable_forms(v):
+                    ff = fold(form)
+                    if len(ff) >= 3:
+                        forms.append((ff, str(v["canonical"]).upper(), dim))
+    forms = sorted(set(forms), key=lambda f: len(f[0]), reverse=True)
+    compiled = [(ff, re.compile(rf"(?<![A-Z0-9]){re.escape(ff)}(?![A-Z0-9])"), canon, dim)
+                for ff, canon, dim in forms]
+    _place_patterns_cache = (key, compiled)
+    return compiled
+
+
 def canonical_names(scheme: str, dimension: str) -> list[str]:
     """Every canonical value name `scheme`'s catalogue holds for `dimension`,
     in the YAML's declared order. Empty when the scheme or dimension has no
@@ -1257,11 +1368,31 @@ async def village_names_exact(names: list[str]) -> dict[str, list[dict]]:
     return out
 
 
-async def constituency_contents(ac_name: str) -> dict:
-    """What sits inside one assembly constituency, read live from the only
-    fact that records the dimension (curated.v_employment — see
-    data/schema/schema_for_developers.md; no other fact or scheme carries an
-    AC column at all).
+# Where each AC-capable scheme's rows for one constituency live. MGNREGA carries
+# the column itself; Focus Legacy and CM Elevate Legacy reach ac_name through the
+# declared geography_key FK to dim_geography (the same join their SQL uses —
+# prompt_builder). Reading MGNREGA for every scheme made a Focus Legacy drill-down
+# say "190 villages in the employment data" and offer blocks the scheme has no
+# rows in (KI-146, Focus Legacy use-case re-test 2026-09-29).
+_AC_CONTENTS_SQL = {
+    "MGNREGA": ("SELECT DISTINCT lgd_district, lgd_block, village_code FROM curated.v_employment "
+                "WHERE UPPER(assembly_constituency_name) = UPPER($1)"),
+    "Focus Legacy": ("SELECT DISTINCT f.lgd_district, f.lgd_block, f.village_code "
+                     "FROM curated.v_focus_legacy f JOIN curated.dim_geography g "
+                     "ON g.geography_key = f.geography_key WHERE UPPER(g.ac_name) = UPPER($1) "
+                     "AND f.entity_type <> 'Unresolved'"),
+    "CM Elevate Legacy": ("SELECT DISTINCT v.lgd_district, v.lgd_block, g.village_code "
+                          "FROM curated.v_cm_elevate_disbursement v JOIN curated.dim_geography g "
+                          "ON g.geography_key = v.geography_key WHERE UPPER(g.ac_name) = UPPER($1)"),
+}
+# How the drill-down names each scheme's data ("190 villages in the <this>").
+AC_CONTENTS_SOURCE = {"MGNREGA": "MGNREGA employment data", "Focus Legacy": "Focus Legacy data",
+                      "CM Elevate Legacy": "CM Elevate Legacy data"}
+
+
+async def constituency_contents(ac_name: str, scheme: "str | None" = None) -> dict:
+    """What sits inside one assembly constituency, read live from the chosen
+    scheme's own rows (see _AC_CONTENTS_SQL); MGNREGA when no scheme is given.
 
     Returns {"districts": [...], "blocks": [...], "villages": n}. Used to build
     the drill-down chips offered after a user picks the constituency reading of
@@ -1274,14 +1405,8 @@ async def constituency_contents(ac_name: str) -> dict:
     step. Best-effort — any DB failure returns empty lists and the caller
     simply offers no drill-down."""
     try:
-        rows = await fetch_rows(
-            """
-            SELECT DISTINCT lgd_district, lgd_block, village_code
-            FROM curated.v_employment
-            WHERE UPPER(assembly_constituency_name) = UPPER($1)
-            """,
-            [ac_name],
-        )
+        rows = await fetch_rows(_AC_CONTENTS_SQL.get(scheme or "MGNREGA", _AC_CONTENTS_SQL["MGNREGA"]),
+                                [ac_name])
     except Exception as e:  # noqa: BLE001 — drill-down is an enhancement, never required
         logger.warning("constituency_contents(%r) failed: %s", ac_name, e)
         return {"districts": [], "blocks": [], "villages": 0}

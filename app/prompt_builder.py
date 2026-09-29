@@ -32,7 +32,7 @@ before — a repair most often needs exactly the entity block it was missing.
 """
 import re
 
-from app import schema_introspect
+from app import context_budget, schema_introspect
 from app.annotations import common_mistakes_text, few_shot_examples, prohibited_joins_text
 from app.schema_context import build_schema_context
 
@@ -112,8 +112,8 @@ def _live_schema_block(schemes: list[str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _fewshot_block(schemes: list[str], question: str = "") -> str:
-    examples = few_shot_examples(schemes, question, top_k=5)
+def _fewshot_block(schemes: list[str], question: str = "", top_k: int = 5) -> str:
+    examples = few_shot_examples(schemes, question, top_k=top_k)
     if not examples:
         return ""
     parts = []
@@ -429,36 +429,62 @@ def _fewshot_ranking_text(question: str, entity_result: dict) -> str:
     return f"{question} {extra}".strip() if extra else question
 
 
+# Every builder below hands context_budget.assemble() NAMED sections, joined in
+# the same order as before, so the prompt text is byte-identical. The names
+# exist so each call logs its make-up (tokens per section, total vs the model's
+# budget) as one prompt_context line. Nothing is pruned to fit a budget:
+# every section here is load-bearing, see context_budget's docstring.
+def _dedupe_catalog(catalog_text: str, *already: str) -> str:
+    """The catalogue block minus any line the schema text above it already
+    states verbatim (ignoring surrounding whitespace). Compression, not
+    removal: every distinct description, synonym and metric formula stays."""
+    seen = {ln.strip() for block in already for ln in block.splitlines() if ln.strip()}
+    kept = [ln for ln in catalog_text.splitlines() if not ln.strip() or ln.strip() not in seen]
+    return "\n".join(kept) + ("\n" if catalog_text.endswith("\n") else "")
+
+
 def build_sql_prompt(question: str, schemes: list[str], entity_result: dict) -> str:
+    S = context_budget.Section
     catalog = schema_introspect.catalog_block(schemes)
-    return "".join([
-        build_schema_context(schemes), "\n\n",
-        _live_schema_block(schemes),
-        (catalog + "\n") if catalog else "",
-        _prohibited_block(schemes),
-        _fewshot_block(schemes, _fewshot_ranking_text(question, entity_result)),
-        _common_mistakes_block(schemes),
-        _entities_block(entity_result, question, schemes),
-        f"\nThe user's question is about: {', '.join(schemes)}.\n",
-        f'\nQuestion: "{question}"\nSQL:',
-    ])
+    catalog_text = (catalog + "\n") if catalog else ""
+    backbone = build_schema_context(schemes)
+    live = _live_schema_block(schemes)
+    rank_text = _fewshot_ranking_text(question, entity_result)
+    # Priority-aware: every section that decides WHICH rows and HOW they are
+    # counted is required and never shortened. Only the worked examples and
+    # the catalogue's restatements of the schema can shrink, and only when
+    # the prompt is over PROMPT_BUDGET_SQL_TOKENS (context_budget).
+    return context_budget.assemble_prioritized("sql", [
+        S("schema_backbone", backbone), S("schema_backbone", "\n\n"),
+        S("live_schema", live),
+        S("catalog", catalog_text, required=False, priority=20,
+          compress=(lambda: _dedupe_catalog(catalog_text, backbone, live),)),
+        S("prohibited_joins", _prohibited_block(schemes)),
+        S("few_shot", _fewshot_block(schemes, rank_text), required=False, priority=10,
+          compress=(lambda: _fewshot_block(schemes, rank_text, top_k=3),
+                    lambda: _fewshot_block(schemes, rank_text, top_k=1))),
+        S("common_mistakes", _common_mistakes_block(schemes)),
+        S("resolved_entities", _entities_block(entity_result, question, schemes)),
+        S("scheme_scope", f"\nThe user's question is about: {', '.join(schemes)}.\n"),
+        S("question", f'\nQuestion: "{question}"\nSQL:'),
+    ], schemes=schemes)
 
 
 def build_repair_prompt(question: str, schemes: list[str], entity_result: dict,
                         *, failed_sql: str, error: str, extra_hint: str | None = None) -> str:
-    return "".join([
-        build_schema_context(schemes), "\n\n",
-        _live_schema_block(schemes),
-        _prohibited_block(schemes),
-        _common_mistakes_block(schemes),
-        _entities_block(entity_result, question, schemes),
-        "\nThe previous query FAILED and must be corrected.\n",
-        f"Error: {error}\n",
-        (f"Hint: {extra_hint}\n" if extra_hint else ""),
-        f"Previous query:\n{failed_sql}\n",
-        f'\nQuestion: "{question}"\n',
-        "Return the corrected single read-only SELECT. SQL:",
-    ])
+    return context_budget.assemble("sql_repair", [
+        ("schema_backbone", build_schema_context(schemes)), ("schema_backbone", "\n\n"),
+        ("live_schema", _live_schema_block(schemes)),
+        ("prohibited_joins", _prohibited_block(schemes)),
+        ("common_mistakes", _common_mistakes_block(schemes)),
+        ("resolved_entities", _entities_block(entity_result, question, schemes)),
+        ("failure", "\nThe previous query FAILED and must be corrected.\n"),
+        ("failure", f"Error: {error}\n"),
+        ("failure", (f"Hint: {extra_hint}\n" if extra_hint else "")),
+        ("failed_sql", f"Previous query:\n{failed_sql}\n"),
+        ("question", f'\nQuestion: "{question}"\n'),
+        ("question", "Return the corrected single read-only SELECT. SQL:"),
+    ], schemes=schemes)
 
 
 _VERIFY_CALIBRATION = """
@@ -574,12 +600,12 @@ def build_verify_prompt(question: str, schemes: list[str], entity_result: dict, 
     worked "ok: true" examples so it has a calibration anchor for what a
     passing query looks like, not just failing ones. Still does NOT include
     the SQL-generation few-shot: those are for writing SQL, not judging it."""
-    return "".join([
-        _live_schema_block(schemes),
-        _prohibited_block(schemes),
-        _entities_block(entity_result, question, schemes),
-        "\n", _VERIFY_CALIBRATION, "\n",
-        "\nCheck the SQL below against ONLY these four things:\n"
+    return context_budget.assemble("sql_verify", [
+        ("live_schema", _live_schema_block(schemes)),
+        ("prohibited_joins", _prohibited_block(schemes)),
+        ("resolved_entities", _entities_block(entity_result, question, schemes)),
+        ("calibration", "\n"), ("calibration", _VERIFY_CALIBRATION), ("calibration", "\n"),
+        ("checklist", "\nCheck the SQL below against ONLY these four things:\n"
         "  1. Every PROHIBITED JOIN above — is one of them actually used?\n"
         "  2. Every RESOLVED ENTITY above — is its exact value present in the "
         "WHERE clause (not dropped, not substituted with different text from "
@@ -628,10 +654,10 @@ def build_verify_prompt(question: str, schemes: list[str], entity_result: dict, 
         "unit formatting, or whether the answer text will explain a caveat — "
         "those happen after this query runs, in a separate step, and are not "
         "the SQL's job. If you cannot point to a SPECIFIC one of the four "
-        "checks above that this exact SQL fails, answer ok: true.\n",
-        f'\nQuestion: "{question}"\n',
-        f"\nGenerated SQL:\n{sql}\n",
-        '\nRespond with ONLY a JSON object: {"ok": true} if none of the four '
-        'checks are violated, or {"ok": false, "issue": "<which of the four '
-        'checks it fails, and how>"} if one is.\nJSON:',
-    ])
+        "checks above that this exact SQL fails, answer ok: true.\n"),
+        ("question", f'\nQuestion: "{question}"\n'),
+        ("generated_sql", f"\nGenerated SQL:\n{sql}\n"),
+        ("frame", '\nRespond with ONLY a JSON object: {"ok": true} if none of the four '
+                  'checks are violated, or {"ok": false, "issue": "<which of the four '
+                  'checks it fails, and how>"} if one is.\nJSON:'),
+    ], schemes=schemes)

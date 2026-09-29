@@ -54,6 +54,19 @@ _QTY_RE = re.compile(
 
 _YEAR_RE = re.compile(r"^(?:19|20|21)\d\d$")
 
+# yyyy-mm-dd / yyyy/mm/dd and dd-mm-yyyy / dd/mm/yyyy (also with dots), and the
+# written forms "15 December 2020" / "December 15, 2020" — the "15" of a written
+# date was read as an assumed figure ("not the 15 the question assumes", PMAY-G
+# use-case QA 2026-09-28, KI-094).
+_MONTH_NAME = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|"
+               r"sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)")
+_DATE_RE = re.compile(
+    r"(?<!\d)(?:(?:19|20|21)\d\d[-/.]\d{1,2}[-/.]\d{1,2}"
+    r"|\d{1,2}[-/.]\d{1,2}[-/.](?:19|20|21)\d\d)(?!\d)"
+    r"|(?<!\d)\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?" + _MONTH_NAME + r"\.?,?\s+(?:19|20|21)\d\d(?!\d)"
+    r"|\b" + _MONTH_NAME + r"\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s+(?:19|20|21)\d\d(?!\d)",
+    re.IGNORECASE)
+
 # Words right before the number that mean it is NOT an asserted stock but a
 # ranking cut, a comparison threshold, or a relative-time span.
 _PRECEDING_STOPWORDS = {
@@ -189,8 +202,104 @@ def _is_asserted_quantity(text: str, m: re.Match, value: float, has_scale: bool)
     return bool(kw) and given_ctx
 
 
+# ── Stated amount filters ──────────────────────────────────────────────────
+# "What is the total disbursement for Focus Plus for a loan of five thousand
+# across all financial years?" (reported 2026-09-29) ran
+#   SELECT SUM(amount_disbursed) FROM curated.v_focus_plus
+# — the "five thousand" silently gone. In Focus Plus it is not noise: a payment
+# is either ₹5,000 (Tranch 1, FY 2022-23) or ₹2,500 (every later tranche), so
+# the dropped filter changed the answer about 2.5x. An amount stated as the
+# SIZE of each payment / loan / instalment is a FILTER, never an asserted
+# stock: stated_amount_filters() reads it, and extract_premises() leaves it out.
+_UNITS = {w: i for i, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen "
+    "fifteen sixteen seventeen eighteen nineteen".split())}
+_TENS = {w: 10 * (i + 2) for i, w in enumerate(
+    "twenty thirty forty fifty sixty seventy eighty ninety".split())}
+_MULT = {"hundred": 100, "thousand": 1_000, "lakh": 100_000, "lakhs": 100_000, "lac": 100_000,
+         "lacs": 100_000, "crore": 10_000_000, "crores": 10_000_000}
+_NUMBER_WORD = r"(?:" + "|".join(sorted([*_UNITS, *_TENS, *_MULT], key=len, reverse=True)) + r")"
+_AMOUNT = (
+    r"(?:(?:₹|rs\.?|inr)\s*)?"
+    r"(?:(?P<digits>\d{1,3}(?:,\d{2,3})+|\d+(?:\.\d+)?)(?![-/]\d)\s*"
+    r"(?P<dscale>k|thousand|lakhs?|lacs?|crores?)?\b"
+    # A run of number words; "and" only between two of them ("one lakh and
+    # fifty thousand"). Never a bare "a", which would read "a loan" as an amount.
+    r"|(?P<words>\b" + _NUMBER_WORD + r"(?:(?:[\s-]+and)?[\s-]+" + _NUMBER_WORD + r")*\b))"
+    r"(?:\s*(?:rupees?|rs\.?|/-))?")
+_AMOUNT_NOUN = (r"(?P<noun>loans?|payments?|instal+ments?|tranch(?:e|es)?|grants?|benefits?|"
+                r"subsid(?:y|ies)|disbursements?|transfers?)")
+_STATED_AMOUNT_RE = re.compile(
+    _AMOUNT_NOUN + r"\s+(?:amount\s+)?(?:of|worth|for|=)\s+" + _AMOUNT
+    + r"|" + _AMOUNT.replace("?P<digits>", "?P<digits2>").replace("?P<dscale>", "?P<dscale2>")
+    .replace("?P<words>", "?P<words2>") + r"\s*" + _AMOUNT_NOUN.replace("?P<noun>", "?P<noun2>"),
+    re.IGNORECASE)
+
+
+def words_to_number(text: str) -> "float | None":
+    """"five thousand" -> 5000, "two thousand five hundred" -> 2500,
+    "one lakh fifty thousand" -> 150000. None when a word is not a number word
+    or nothing numeric is present."""
+    total, current, seen = 0, 0, False
+    for w in re.split(r"[\s-]+", (text or "").lower().strip()):
+        if not w or w in ("and", "a"):
+            continue
+        if w in _UNITS:
+            current += _UNITS[w]
+        elif w in _TENS:
+            current += _TENS[w]
+        elif w == "hundred":
+            current = (current or 1) * 100
+        elif w in _MULT:
+            total += (current or 1) * _MULT[w]
+            current = 0
+        else:
+            return None
+        seen = True
+    return float(total + current) if seen else None
+
+
+@dataclass
+class StatedAmount:
+    value: float    # rupees, scale expanded
+    text: str       # the whole phrase as typed, e.g. "loan of five thousand"
+    noun: str       # "loan", "payment", ...
+    span: tuple     # (start, end) in the question
+
+
+def stated_amount_filters(question: str) -> list[StatedAmount]:
+    """Each amount the question states as the size of a payment / loan /
+    instalment ("a loan of five thousand", "payments of ₹2,500", "₹5,000
+    instalments"). Amounts under ₹100 are ignored ("tranche of 4" is not money)."""
+    out: list[StatedAmount] = []
+    for m in _STATED_AMOUNT_RE.finditer(question or ""):
+        g = m.groupdict()
+        digits, dscale, words = (g.get("digits") or g.get("digits2"),
+                                 g.get("dscale") or g.get("dscale2"), g.get("words") or g.get("words2"))
+        noun = (g.get("noun") or g.get("noun2") or "").lower()
+        if digits and not dscale and _YEAR_RE.match(digits) \
+                and not re.search(r"₹|\brs\b|\binr\b|rupee", m.group(0), re.IGNORECASE):
+            continue   # "a loan for 2024" names a year, not an amount
+        if digits:
+            value = float(digits.replace(",", "")) * _SCALE.get((dscale or "").lower(), 1)
+        else:
+            value = words_to_number(words or "")
+        if value is None or value < 100:
+            continue
+        out.append(StatedAmount(value=value, text=m.group(0).strip(), noun=noun.rstrip("s"),
+                                span=(m.start(), m.end())))
+    return out
+
+
 def extract_premises(question: str) -> list[Premise]:
     q = _normalise_phrases(question or "")
+    # A calendar date is a filter, not an asserted stock: "sanctioned on
+    # 2017-11-28" yielded premises 11 and 28, and the composer answered "504
+    # houses, not the 11 or 28 figures assumed" (2026-09-27 screenshot). Blank
+    # dates out, length-preserving so spans still index into `question`.
+    q = _DATE_RE.sub(lambda d: " " * len(d.group(0)), q)
+    # A stated payment size ("payments of ₹5,000") is a filter too.
+    q = _STATED_AMOUNT_RE.sub(lambda d: " " * len(d.group(0)), q)
     out: list[Premise] = []
     for m in _QTY_RE.finditer(q):
         try:

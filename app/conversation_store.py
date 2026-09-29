@@ -329,6 +329,35 @@ async def _save_context_state(session_id: str, context_state: dict, summary: str
         logger.warning("conversation_store: save_context_state failed (non-fatal): %s", e)
 
 
+async def save_session_state(*, tenant_id, user_id, session_id: str, title: str,
+                             snapshot: dict, rev: int, summary: str | None) -> bool:
+    """AWAITED write of the session's durable snapshot (app/session_sync.py).
+    Returns True when this revision was stored.
+
+    Unlike save_context_state above, this is not fire-and-forget. The next
+    request may land on another worker immediately, and it must read what
+    this one wrote. It is an UPSERT on the conversation row, so it no longer
+    depends on persist_turn's insert having committed first; a first-turn
+    state used to be dropped when the UPDATE ran before that insert did. The
+    `rev` guard rejects a stale write: two concurrent requests on the same
+    session both start from rev N, the first to commit N+1 wins, and the other
+    is refused rather than overwriting it. Last writer does NOT win."""
+    snap = {**snapshot, "rev": int(rev)}
+    row = await db.fetchrow(
+        """INSERT INTO app.conversations
+               (tenant_id, user_id, session_id, title, turn_count, context_state, summary)
+           VALUES ($1, $2, $3, $4, 0, $5::jsonb, $6)
+           ON CONFLICT (session_id) DO UPDATE
+               SET context_state = EXCLUDED.context_state,
+                   summary = COALESCE(EXCLUDED.summary, app.conversations.summary)
+               WHERE COALESCE((app.conversations.context_state->>'rev')::int, 0) < $7
+           RETURNING conv_id""",
+        [tenant_id, user_id, session_id, (title or "")[:120],
+         json.dumps(snap, default=str), summary, int(rev)],
+    )
+    return row is not None
+
+
 async def load_context_state(session_id: str) -> dict:
     """The durable (L2) structured state + summary for a session — used to
     rehydrate app.session_store.Session.state when a conversation resumes on a

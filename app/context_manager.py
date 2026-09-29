@@ -49,6 +49,7 @@ grants access to a query the current turn's own scope wouldn't already pass.
 import logging
 import re
 import time
+from decimal import Decimal
 
 from app.config import settings
 from app.session_store import ConversationState, Session
@@ -196,6 +197,40 @@ def inject_scheme_hint(question: str, state: "ConversationState | None") -> str:
     return out
 
 
+def inject_year_scope(question: str, state: "ConversationState | None",
+                      year_action: str = "KEEP") -> str:
+    """Carry an "all financial years" choice into a follow-up that keeps the
+    year (KI-030). Live 2026-09-26: after the user picked "All financial years
+    combined", "Show it by district." paused for the year again — an all-years
+    choice is not a resolved entity, so neither prior_resolved nor the state
+    carried it. Appends the phrase the year gate reads (_ALL_YEARS_CUE) only
+    when: the state holds year_all; the follow-up neither names nor changes the
+    year; it is not a how-the-scheme-works question; and no scheme it names
+    lacks a time dimension (CM Elevate). Otherwise the question is unchanged."""
+    # A follow-up that CLEARs the year ("all years", "all of them combined"
+    # after two single-year turns) gets the phrase too, so the year gate reads
+    # the choice instead of asking it again.
+    if not question or not state:
+        return question
+    if not ((getattr(state, "year_all", False) and year_action == "KEEP") or year_action == "CLEAR"):
+        return question
+    try:
+        from app import context_policy as _cp
+        from app import pipeline as _pipeline
+        if _cp.extract_year_keys(question) or _cp._RELATIVE_YEAR_RX.search(question):
+            return question
+        if _pipeline._ALL_YEARS_CUE.search(question) or _pipeline._KNOWLEDGE_HINTS.search(question):
+            return question
+        schemes = set(_pipeline._named_schemes(question)) | ({state.scheme} if state.scheme else set())
+        if any(not _pipeline._SCHEME_DATA_YEARS.get(s, ["?"]) for s in schemes):
+            return question
+    except Exception:  # noqa: BLE001 — private helpers may change shape; degrade safely
+        return question
+    out = f"{question.rstrip(' ?.')} across all financial years?"
+    logger.info("context_manager.inject_year_scope: %r -> %r", question, out)
+    return out
+
+
 # ── Entity-inheritance fallback (extends resolve_entities' prior_resolved) ──
 def state_to_resolved_entities(state: "ConversationState | None") -> dict:
     """The subset of structured state that resolve_entities' prior_resolved
@@ -234,8 +269,20 @@ def merged_prior_resolved(turn_resolved: dict | None, state: "ConversationState 
     in whatever that turn didn't have (typically because it was a KNOWLEDGE
     or EDGE turn with no resolved_entities of its own)."""
     base = state_to_resolved_entities(state)
+    # A state value whose recorded source is model_inference (no user turn,
+    # pause reply, resolved reference or validated lookup supplied it) is not
+    # inherited. Provenance is recorded by update_state (context_policy).
+    prov = getattr(state, "provenance", None) or {}
+    for fld, key in _STATE_FIELD_KEYS.items():
+        if (prov.get(fld) or {}).get("source") == "model_inference":
+            base.pop(key, None)
     base.update({k: v for k, v in (turn_resolved or {}).items() if v is not None})
     return base
+
+
+# ConversationState field -> its resolve_entities key.
+_STATE_FIELD_KEYS = {"district": "district", "block": "block", "village": "village_code",
+                     "year": "year_key", "tranche": "tranche_label"}
 
 
 # ── Metric-label tracking (for structured state / summary only — never fed
@@ -283,6 +330,35 @@ def detect_comparison_districts(text: str) -> list[str]:
     return found[:4]
 
 
+def _record_provenance(session, raw_question: str, resolved: dict) -> None:
+    """Record where each committed value came from (context_policy.provenance_for).
+    Reads the turn's facts from session.turn_context, which the pipeline sets:
+    the question after reference substitution, the pause reply when this turn
+    resumed one, and the previous question. A field whose value did not change
+    keeps its record, with source previous_user unless it was model_inference."""
+    from app import context_policy
+    state = session.state
+    ctx = getattr(session, "turn_context", None) or {}
+    before = ctx.get("state_before") or {}
+    values = {"scheme": state.scheme, "district": state.district, "block": state.block,
+              "village": state.village, "year": state.year, "metric": state.metric,
+              "tranche": state.tranche}
+    for fld, value in values.items():
+        if value is None:
+            state.provenance.pop(fld, None)
+            continue
+        key = _STATE_FIELD_KEYS.get(fld)
+        rec = context_policy.provenance_for(
+            fld, value, raw_question=raw_question,
+            substituted_question=ctx.get("substituted_question") or raw_question,
+            prior_value=before.get(fld), prior_record=state.provenance.get(fld),
+            clarification_reply=ctx.get("clarification_reply"),
+            previous_question=ctx.get("previous_question") or "",
+            validated=bool(key and key in resolved))
+        rec["turn"] = state.turn_count
+        state.provenance[fld] = rec
+
+
 # ── Context Updater ──────────────────────────────────────────────────────────
 def update_state(session: "Session | None", raw_question: str, standalone_question: str,
                  result: dict) -> None:
@@ -308,14 +384,67 @@ def update_state(session: "Session | None", raw_question: str, standalone_questi
             # came before it either).
             return
 
+        if not (result.get("sql") or result.get("schemes") or result.get("resolved_entities")):
+            # A DATA turn that resolved nothing and ran nothing: the "couldn't build
+            # a working query" fallback (pipeline._data_path_kb_fallback) returns
+            # exactly this shape. Its question was never validated against the
+            # data, so it must not overwrite the last known-good state. It
+            # previously replaced `metric`, and a failed "compare X and Y" replaced
+            # comparison_entities, so a later "the former" resolved against a
+            # comparison that never ran.
+            return
+
         schemes = result.get("schemes") or []
         resolved = result.get("resolved_entities") or {}
+        # The committed scheme changed: a filter this result does not name was the
+        # OLD scheme's and was not carried (a substitution that carries one
+        # resolves it, so it is named). Live 2026-09-29: a CM Elevate Legacy FY
+        # 2024-25 turn, then a Focus Plus answer, would otherwise leave year=2024
+        # under Focus Plus.
+        _scheme_changed = bool(len(schemes) == 1 and state.scheme and schemes[0] != state.scheme)
         if len(schemes) == 1:
             state.scheme = schemes[0]
         elif len(schemes) >= 2:
             state.scheme = None
             state.comparison_entities = list(schemes)
             state.comparison_kind = "scheme"
+
+        # Fields this turn no longer holds (KI-032, live 2026-09-26: after
+        # "what about South Garo Hills?" the committed state still said
+        # block=DALU, and every later follow-up inherited it). A follow-up's
+        # merge plan says which fields it REPLACEd or CLEARed; one the result
+        # does not name again is dropped. A turn with no plan was a question of
+        # its own — it inherited nothing (prior_resolved is follow-up only), so
+        # its resolved entities ARE its whole scope, and older places and years
+        # are dropped with it.
+        _plan = ((getattr(session, "turn_context", None) or {}).get("plan") or {})
+        _actions = _plan.get("actions") or {}
+        _held = {"district": resolved.get("district"), "block": resolved.get("block"),
+                 "village": resolved.get("village") or resolved.get("village_code"),
+                 "year": resolved.get("year_key")}
+        for _fld, _val in _held.items():
+            if _val is not None:
+                continue
+            if not _plan or _scheme_changed or _actions.get(_fld) in ("CLEAR", "REPLACE"):
+                setattr(state, _fld, None)
+                if _fld == "year":
+                    state.previous_year = None
+        # The dimension this follow-up changed, for a later "all of them".
+        _changed = [f for f in ("year", "district", "block") if _actions.get(f) == "REPLACE"]
+        state.last_dimension = _changed[0] if (_plan and len(_changed) == 1) else None
+        # "All financial years" as a resolved time scope (KI-030).
+        if resolved.get("year_key") is not None:
+            state.year_all = False
+        else:
+            try:
+                from app import pipeline as _pipeline
+                _all_years = bool(_pipeline._ALL_YEARS_CUE.search(standalone_question or raw_question or ""))
+            except Exception:  # noqa: BLE001
+                _all_years = False
+            if _all_years:
+                state.year_all = True
+            elif not _plan or _scheme_changed or _actions.get("year") in ("CLEAR", "REPLACE"):
+                state.year_all = False
 
         if resolved.get("district"):
             state.district = str(resolved["district"])
@@ -354,6 +483,8 @@ def update_state(session: "Session | None", raw_question: str, standalone_questi
         if metric:
             state.metric = metric
 
+        _record_provenance(session, raw_question, resolved)
+
         districts = detect_comparison_districts(standalone_question or raw_question)
         if len(districts) >= 2:
             state.comparison_entities = districts
@@ -371,6 +502,264 @@ def _approx_tokens(text: str) -> int:
 def _truncate_to_tokens(text: str, max_tokens: int) -> str:
     limit_chars = max(0, max_tokens * 4)
     return text if len(text) <= limit_chars else text[:limit_chars].rstrip() + "…"
+
+
+# Section headers of the follow-up context block (build_followup_context).
+# split_followup_context parses the block by these same constants, so the
+# provenance check in pipeline.rewrite_followup can tell the structured-state
+# line apart from the LLM summary and the older turns.
+STATE_HEADER = "Known context:"
+HISTORY_HEADER = "Relevant earlier turns:"
+SUMMARY_HEADER = "Conversation summary so far:"
+
+
+# ── Follow-up rewrite evidence (tiers 1-3) ──────────────────────────────────
+# The follow-up rewrite used to put the first 300 characters of the previous
+# ANSWER into its prompt on every follow-up, and told the model it could take
+# districts, years and schemes from it. That slice is the wrong unit in both
+# directions:
+#   * too much: a list answer's opening names several districts or blocks the
+#     follow-up never mentioned, and the model is free to copy one into the
+#     new question (measured 2026-09-26: a long answer's slice carried Dalu,
+#     Rongram, Tura and Phulbari into "How many beneficiaries were there?");
+#   * too little: a character cut can end mid-name, and anything past character
+#     300 is invisible even when the follow-up points at it ("the last one").
+# What the rewrite needs is the previous turn's SCOPE, and that is already
+# structured: the schemes and the resolved entities the SQL was filtered on.
+# So the evidence is tiered:
+#   Tier 1  PREVIOUS filters — schemes + resolved entities. Always sent.
+#   Tier 2  PREVIOUS result — a deterministic summary of the result ROWS, in
+#           result order. Sent only when the follow-up points into the result.
+#   Tier 3  a sentence-bounded excerpt of the previous answer. Only when the
+#           follow-up points into the result and there are no rows (a
+#           knowledge answer).
+# pipeline.rewrite_followup then checks the rewrite against exactly these
+# sources (_rewrite_provenance_violation), so every inherited name has one.
+
+_RESULT_REF_RX = re.compile(
+    r"\b(?:the\s+)?(?:first|second|third|fourth|fifth|last|top|bottom|highest|lowest|"
+    r"largest|smallest|biggest)\s+(?:one|ones|two|three|five|ten|\d+|district|districts|"
+    r"block|blocks|village|villages|scheme|schemes|group|groups|pgs?|entry|entries|item|"
+    r"items|row|rows|component|components|tranche|tranches)\b"
+    # "this scheme" is deliberately NOT here — it names the scheme in play,
+    # not an item of the previous result.
+    r"|\b(?:that|those|these|this)\s+(?:one|ones|district|districts|block|blocks|village|"
+    r"villages|group|groups|pgs?|component|components|tranche|tranches)\b"
+    r"|\b(?:of|among|each\s+of|all\s+of|any\s+of)\s+(?:them|those|these)\b"
+    # "How much was it?" / "what were they?": a pronoun standing for the
+    # previous result's subject (Scenario D, 2026-09-26). Only as the question's
+    # last words, so "show it by district" is not a result reference.
+    r"|\b(?:was|is|were|are)\s+(?:it|that|they|those)\s*[?.!]*\s*$",
+    re.IGNORECASE,
+)
+_HISTORY_REF_RX = re.compile(
+    r"\b(?:earlier|previously|at\s+the\s+start|in\s+the\s+beginning|"
+    r"we\s+(?:discussed|talked\s+about|looked\s+at)|you\s+(?:said|mentioned|showed)|"
+    r"(?:first|original|initial)\s+question)\b",
+    re.IGNORECASE,
+)
+
+
+def references_previous_result(question: str) -> bool:
+    """True when the follow-up points at an ITEM of the previous result ("the
+    top one", "that block", "the second one", "each of them"), which only the
+    result itself can resolve. A new ranking question ("which one had the
+    highest?") or a re-cut ("show it by district") does not need the result's
+    content, and so does not get it."""
+    return bool(_RESULT_REF_RX.search(question or ""))
+
+
+def references_history(question: str) -> bool:
+    """True when the follow-up explicitly reaches further back than the last
+    turn ("the district we discussed earlier"). Only then are names from the
+    conversation summary or older turns an acceptable source for the rewrite."""
+    return bool(_HISTORY_REF_RX.search(question or ""))
+
+
+_NUMERIC_STR_RX = re.compile(r"^-?\d+(?:\.\d+)?$")
+# Columns that identify a row rather than measure it, even when numeric
+# (year_key 2023, village_code 277769).
+_LABEL_LIKE_COL_RX = re.compile(r"(?:_key|_code|_id|year|_name|label)$|^(?:year|fy)",
+                                re.IGNORECASE)
+
+
+def _is_number(v) -> bool:
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, (int, float, Decimal)):
+        return True
+    return isinstance(v, str) and bool(_NUMERIC_STR_RX.match(v.strip()))
+
+
+def _cell(v) -> str:
+    s = str(v)
+    return s if len(s) <= 60 else s[:57] + "..."
+
+
+def _join_within(head: str, items: list[str], limit_chars: int, total: int) -> str:
+    """head + as many whole items as fit in limit_chars, then '... +N more'.
+    Items are never cut part-way."""
+    out, used = head, 0
+    for it in items:
+        piece = ("; " if used else "") + it
+        if len(out) + len(piece) > limit_chars:
+            break
+        out += piece
+        used += 1
+    if total - used > 0:
+        out += ("; " if used else "") + f"... +{total - used} more"
+    return out
+
+
+def summarize_result(result: "dict | None", max_tokens: "int | None" = None) -> str:
+    """Tier 2: a deterministic, token-budgeted summary of a DATA turn's result
+    ROWS, in the order the query returned them. Built from the rows, not the
+    composed prose, so it holds exactly the values that were queried. Empty for
+    anything that isn't a DATA result with rows. Never raises.
+
+        1 row: amount_raw=1234567; beneficiaries=88
+        5 rows by block_name_raw, in result order: Dalu (20000); Rongram (19000); ... +3 more
+    """
+    try:
+        if not result or result.get("route") != "data":
+            return ""
+        rows = result.get("rows") or result.get("data") or []
+        if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+            return ""
+        budget = settings.CONTEXT_PREV_RESULT_MAX_TOKENS if max_tokens is None else max_tokens
+        limit = max(0, budget * 4)
+        total = int(result.get("row_count") or 0) or len(rows)
+        first = rows[0]
+        if total == 1:
+            items = [f"{k}={_cell(v)}" for k, v in first.items()]
+            return _join_within("1 row: ", items, limit, len(items))
+        cols = list(first.keys())
+        label = next((c for c in cols if isinstance(first[c], str) and not _is_number(first[c])),
+                     None) or next((c for c in cols if _LABEL_LIKE_COL_RX.search(c)), None)
+        if label is None:
+            return f"{total} rows; columns: {', '.join(cols)}"
+        value = next((c for c in cols if c != label and _is_number(first.get(c))
+                      and not _LABEL_LIKE_COL_RX.search(c)), None)
+        items = [f"{_cell(r.get(label))} ({_cell(r.get(value))})" if value else _cell(r.get(label))
+                 for r in rows]
+        return _join_within(f"{total} rows by {label}, in result order: ", items, limit, total)
+    except Exception:  # noqa: BLE001 — evidence is optional; a bad row shape just means none
+        logger.warning("context_manager.summarize_result failed (non-fatal)", exc_info=True)
+        return ""
+
+
+_SENTENCE_SPLIT_RX = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def answer_excerpt(answer: str, max_tokens: "int | None" = None) -> str:
+    """Tier 3: the previous answer's opening, cut at a sentence or line
+    boundary within the token budget. It is never cut mid-sentence or
+    mid-name: when even the first sentence is over budget, it returns ''
+    rather than a fragment."""
+    budget = settings.CONTEXT_PREV_ANSWER_MAX_TOKENS if max_tokens is None else max_tokens
+    limit = max(0, budget * 4)
+    out: list[str] = []
+    used = 0
+    for s in (p.strip() for p in _SENTENCE_SPLIT_RX.split(answer or "")):
+        if not s:
+            continue
+        add = len(s) + (1 if out else 0)
+        if used + add > limit:
+            break
+        out.append(s)
+        used += add
+    return " ".join(out)
+
+
+# resolved_entities key -> the label shown in the PREVIOUS filters line.
+# village_code is left out on purpose: a bare surrogate integer tells the
+# rewrite nothing (the village NAME is already in the previous question), and
+# resolve_entities' prior_resolved fallback carries the code itself.
+_FILTER_LABELS = (
+    ("district", "district"), ("district_list", "districts"), ("block", "block"),
+    ("block_list", "blocks"), ("assembly_constituency", "constituency"),
+    ("year_key", "year"), ("tranche_label", "tranche"), ("cm_scheme", "sub-scheme"),
+    ("house_status", "house status"),
+)
+
+
+def previous_filters_line(prev: object) -> str:
+    """Tier 1: the previous turn's scope as one structured line, e.g.
+    'PREVIOUS filters: scheme=Focus Plus; district=WEST GARO HILLS; year=FY 2024-25'.
+    Empty when the turn carried no schemes or entities (an older Turn, or a
+    knowledge turn)."""
+    parts: list[str] = []
+    schemes = list(getattr(prev, "schemes", None) or [])
+    if schemes:
+        parts.append("scheme=" + " + ".join(schemes))
+    resolved = getattr(prev, "resolved_entities", None) or {}
+    for key, label in _FILTER_LABELS:
+        v = resolved.get(key)
+        if v is None or v == "" or v == []:
+            continue
+        vals = v if isinstance(v, (list, tuple)) else [v]
+        if key == "year_key":
+            try:
+                vals = [_fy_text(int(x)) for x in vals]
+            except (TypeError, ValueError):
+                continue
+        parts.append(f"{label}=" + ", ".join(str(x) for x in vals))
+    return "PREVIOUS filters: " + "; ".join(parts) if parts else ""
+
+
+def build_rewrite_evidence(question: str, prev: object, kind: "str | None" = None) -> dict:
+    """What the follow-up rewrite gets to see about the previous turn, by tier
+    (see the block comment above). Returns {"filters", "result", "answer",
+    "tiers"}: each text is empty when its tier doesn't apply, and "tiers" names
+    the tiers actually used (for the prompt_context log). Never raises: on
+    any error it returns no evidence, and the rewrite still has the previous
+    question."""
+    empty = {"filters": "", "result": "", "answer": "", "tiers": []}
+    try:
+        # The follow-up's kind (context_policy.plan_state_merge) picks the
+        # layers. Without a kind (older callers), the result layer is gated by
+        # the result-reference cue, as before.
+        from app import context_policy
+        layers = (context_policy.context_layers(kind) if kind
+                  else ("filters", "result") if references_previous_result(question)
+                  else ("filters",))
+        filters = previous_filters_line(prev) if "filters" in layers else ""
+        out = {"filters": filters, "result": "", "answer": "",
+               "tiers": ["filters"] if filters else []}
+        if "result" in layers:
+            summary = getattr(prev, "result_summary", "") or ""
+            if summary:
+                out["result"] = f"PREVIOUS result: {summary}"
+                out["tiers"].append("result")
+            else:
+                excerpt = answer_excerpt(getattr(prev, "answer", "") or "")
+                if excerpt:
+                    out["answer"] = f'PREVIOUS answer (excerpt): "{excerpt}"'
+                    out["tiers"].append("answer_excerpt")
+        return out
+    except Exception:  # noqa: BLE001
+        logger.warning("context_manager.build_rewrite_evidence failed (non-fatal)", exc_info=True)
+        return empty
+
+
+def split_followup_context(extra_context: str) -> dict:
+    """Split build_followup_context's block back into {"state", "history",
+    "summary"}. The provenance check treats these differently: the
+    structured-state line is always a valid source, while the LLM summary and
+    older turns are a valid source only when the follow-up reaches back to them
+    (references_history). Unrecognised lines count as history, the stricter
+    side."""
+    out = {"state": "", "history": "", "summary": ""}
+    history: list[str] = []
+    for line in (extra_context or "").splitlines():
+        if line.startswith(STATE_HEADER):
+            out["state"] = line
+        elif line.startswith(SUMMARY_HEADER):
+            out["summary"] = line
+        elif line.strip():
+            history.append(line)
+    out["history"] = "\n".join(history)
+    return out
 
 
 def build_state_block(state: "ConversationState | None") -> str:
@@ -391,16 +780,19 @@ def build_state_block(state: "ConversationState | None") -> str:
         parts.append(f"village={state.village}")
     if state.year is not None:
         parts.append(f"year={_fy_text(state.year)}")
+    elif getattr(state, "year_all", False):
+        parts.append("year=all financial years")
     if state.metric:
         parts.append(f"metric={state.metric}")
     if state.tranche:
         parts.append(f"tranche={state.tranche}")
     elif state.tranche_all_combined:
         parts.append("tranche=all combined")
-    return "Known context: " + ", ".join(parts) if parts else ""
+    return STATE_HEADER + " " + ", ".join(parts) if parts else ""
 
 
-async def build_followup_context(session: "Session | None", question: str) -> str:
+async def build_followup_context(session: "Session | None", question: str,
+                                 state: "ConversationState | None" = None) -> str:
     """The enrichment block passed to rewrite_followup() as `extra_context` —
     structured state + conversation summary + (only for a long/resumed
     conversation, where the in-process turn window is thin) semantically
@@ -411,7 +803,8 @@ async def build_followup_context(session: "Session | None", question: str) -> st
     Priority order (highest first, per the spec): current question (not
     built here — the caller appends it separately), system instructions
     (also the caller's), structured state, recent turns (already in
-    rewrite_followup's own prompt as PREVIOUS question/answer), relevant
+    rewrite_followup's own prompt as PREVIOUS question / filters / result —
+    see build_rewrite_evidence), relevant
     historical turns, summary. Truncation drops the LOWEST-priority section
     first when the budget is tight.
     """
@@ -421,7 +814,9 @@ async def build_followup_context(session: "Session | None", question: str) -> st
     sections: list[str] = []
 
     try:
-        state_block = build_state_block(session.state)
+        # `state`: the thread this follow-up continues, when the caller decided
+        # it is not the session's (pipeline._followup_thread_state).
+        state_block = build_state_block(state if state is not None else session.state)
     except Exception:  # noqa: BLE001
         state_block = ""
     if state_block:
@@ -450,7 +845,7 @@ async def build_followup_context(session: "Session | None", question: str) -> st
         if hits:
             lines = [f'- Q: "{h["standalone_question"] or h["question"]}" A: "{h["answer"][:160]}"'
                      for h in hits]
-            block = "Relevant earlier turns:\n" + "\n".join(lines)
+            block = HISTORY_HEADER + "\n" + "\n".join(lines)
             block = _truncate_to_tokens(block, max(0, min(budget, 400)))
             if block:
                 sections.append(block)
@@ -458,7 +853,7 @@ async def build_followup_context(session: "Session | None", question: str) -> st
 
     if settings.CONTEXT_SUMMARY_ENABLED and session.summary and budget > 0:
         block = _truncate_to_tokens(
-            f"Conversation summary so far: {session.summary}",
+            f"{SUMMARY_HEADER} {session.summary}",
             min(budget, settings.CONTEXT_SUMMARY_MAX_TOKENS),
         )
         sections.append(block)
@@ -503,14 +898,10 @@ async def maybe_update_summary(session: "Session | None") -> None:
             session.summary = out
             session.summary_turn_count = session.state.turn_count
             logger.info("context_manager: summary updated (turn_count=%d)", session.state.turn_count)
-            try:
-                from app import conversation_store
-                conversation_store.save_context_state(
-                    session_id=session.session_id,
-                    context_state=session.state.to_dict(),
-                    summary=session.summary,
-                )
-            except Exception:  # noqa: BLE001 — L2 persistence is best-effort
-                logger.warning("context_manager: could not persist summary (non-fatal)", exc_info=True)
+            # Not persisted here. The router's awaited session_sync.sync_out
+            # carries session.summary in the same versioned write as the rest of
+            # the turn. A separate fire-and-forget write from here could finish
+            # AFTER that write and replace the newer snapshot with this older
+            # state (2026-09-26, KI-028).
     except Exception:  # noqa: BLE001 — requirement 9: continue without the new summary
         logger.warning("context_manager: summary generation failed (non-fatal)", exc_info=True)

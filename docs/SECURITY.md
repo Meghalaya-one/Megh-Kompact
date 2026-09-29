@@ -39,7 +39,7 @@ safe default, so local dev is unaffected.
 | Control | Where |
 | --- | --- |
 | LLM-generated SQL is validated: single statement, `SELECT`/`WITH` lead only, no write/DDL keywords, forced `LIMIT` | `app/db.py::_assert_safe`, `run_readonly` |
-| DB connection is a **SELECT-only role** (`megh_app` / `megh_readonly`) — second layer, not a substitute | `deploy/sql/01_create_megh_app_role.sql` |
+| DB connection role — second layer, not a substitute. **Correction (2026-09-26):** `megh_app` is SELECT-only on `curated`/`semantic` but has **SELECT/INSERT/UPDATE/DELETE + CREATE on `app`**, and generated SQL runs on the same pool, so it is *not* a SELECT-only role for generated SQL. The local dev `.env` connects as `postgres`. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) KI-004 | `deploy/sql/01_create_megh_app_role.sql` |
 | Our own SQL is always parameter-bound, never interpolated | `app/db.py::fetch_rows` etc. |
 | `question` field length-capped (`MAX_QUESTION_CHARS`) and C0-control-char stripped; `session_id` pattern-restricted; length caps on every admin/auth free-text field and list | `app/routers/*.py` |
 | **OWASP CRS WAF** in front (SQLi/XSS/RCE families), staged rollout | `deploy/nginx/modsecurity/` |
@@ -124,6 +124,24 @@ if tokens ever need to be killed mid-session.
   port anywhere in the request path.
 
 ---
+
+## Known gaps (audit 2026-09-26)
+
+The controls above describe what exists. These verified gaps are tracked in
+[KNOWN_ISSUES.md](KNOWN_ISSUES.md):
+
+| ID | Gap |
+|---|---|
+| KI-022 | **Critical.** The raw Focus Legacy file (`Focus Legacy to share to BLH.csv`) holds 14,491 unmasked account numbers and 10,353 holder names, and it is committed and pushed to `origin` |
+| KI-023 | Plaintext admin seed passwords in `app/users.yaml` (committed) |
+| KI-004 | No table allowlist. Generated SQL runs with access to `app.*` and the privacy tables. There is a prompt-injection path to `app.users`, and the local `.env` uses the `postgres` superuser |
+| KI-007 | `authorize()` ignores `block_name_raw` and the AC columns |
+| KI-015 | Gateway TLS falls back to `verify=False` |
+| KI-024 | `ASR_DEBUG_DIR` stores voice recordings (set on the dev box) |
+| KI-016 | No JWT revocation (accepted) |
+
+Also: the JWT is kept in `localStorage` while the CSP allows `'unsafe-inline'` scripts, so any XSS
+could read the token (INFERRED; no XSS was found or tested).
 
 ## Deploy checklist (security-relevant)
 

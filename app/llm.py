@@ -13,7 +13,9 @@ SSL behavior:
 """
 
 import asyncio
+import contextvars
 import logging
+import time
 import os
 import re
 from contextlib import asynccontextmanager
@@ -155,6 +157,37 @@ async def _slot():
         _gate.release()
 
 
+# ── Per-call measurement ─────────────────────────────────────────────────────
+# One `llm_call` log line per chat completion: the role, the model, the time
+# spent waiting for a concurrency slot, the gateway round trip, and the
+# gateway's own token counts (`usage`, when it returns one). There is no
+# streaming here (see CLAUDE.md), so time-to-first-token equals the round trip.
+# A caller that wants the numbers themselves (tests/live_context_validation.py)
+# sets llm_calls_var to a list for the duration of a request.
+llm_calls_var: "contextvars.ContextVar[list | None]" = contextvars.ContextVar(
+    "llm_calls", default=None)
+
+
+def _record_call(role: str, model: str, t_wait: float, t_start: float, usage: dict) -> None:
+    try:
+        now = time.perf_counter()
+        rec = {
+            "role": role, "model": model,
+            "queue_ms": round((t_start - t_wait) * 1000, 1),
+            "latency_ms": round((now - t_start) * 1000, 1),
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+        }
+        sink = llm_calls_var.get()
+        if sink is not None:
+            sink.append(rec)
+        logger.info("llm_call role=%s model=%s queue_ms=%s latency_ms=%s prompt_tokens=%s "
+                    "completion_tokens=%s", rec["role"], model, rec["queue_ms"],
+                    rec["latency_ms"], rec["prompt_tokens"], rec["completion_tokens"])
+    except Exception:  # noqa: BLE001 — measurement never costs an answer
+        logger.debug("llm_call record failed", exc_info=True)
+
+
 async def call_model(
     *,
     base_url: str,
@@ -165,6 +198,7 @@ async def call_model(
     max_tokens: int = 1024,
     timeout: float = 30.0,
     guided: dict | None = None,
+    role: str = "",
 ) -> str:
 
     if _client is None:
@@ -194,7 +228,9 @@ async def call_model(
         # vLLM OpenAI-compatible guided decoding fields.
         payload.update(guided)
 
+    t_wait = time.perf_counter()
     async with _slot():
+        t_start = time.perf_counter()
 
         resp = await _client.post(
             f"{base_url.rstrip('/')}/chat/completions",
@@ -230,6 +266,7 @@ async def call_model(
     resp.raise_for_status()
 
     data = resp.json()
+    _record_call(role or model, model, t_wait, t_start, data.get("usage") or {})
 
     return data["choices"][0]["message"]["content"]
 
@@ -248,6 +285,7 @@ async def call_classifier(
         temperature=settings.CLASSIFIER_TEMPERATURE,
         max_tokens=200,
         timeout=settings.CLASSIFIER_TIMEOUT_SECONDS,
+        role="classifier",
         guided=guided if settings.GUIDED_DECODING_ENABLED else None,
     )
 
@@ -266,6 +304,7 @@ async def call_sql_generator(
         temperature=settings.SQL_GENERATION_TEMPERATURE,
         max_tokens=1024,
         timeout=settings.SQL_GENERATION_TIMEOUT_SECONDS,
+        role="sql",
         guided=guided if settings.SQL_GUIDED_DECODING_ENABLED else None,
     )
 
@@ -280,6 +319,7 @@ async def call_response_composer(prompt: str) -> str:
         temperature=settings.RESPONSE_TEMPERATURE,
         max_tokens=settings.RESPONSE_MAX_TOKENS,
         timeout=settings.RESPONSE_TIMEOUT_SECONDS,
+        role="compose",
     )
 
 
@@ -300,6 +340,7 @@ async def call_sql_verifier(
         temperature=settings.SQL_VERIFY_TEMPERATURE,
         max_tokens=200,
         timeout=settings.SQL_VERIFY_TIMEOUT_SECONDS,
+        role="sql_verify",
         guided=guided if settings.GUIDED_DECODING_ENABLED else None,
     )
 

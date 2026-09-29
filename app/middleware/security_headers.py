@@ -25,6 +25,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
 from app.config import settings
+from app.context_budget import request_id_var
 
 # microphone=(self) so the "Speak" voice-query feature on our own pages can call
 # getUserMedia; still denied for cross-origin frames. camera/geolocation stay off.
@@ -62,6 +63,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         rid = request.headers.get("x-request-id", "").strip()[:64] or uuid.uuid4().hex
         request.state.request_id = rid
+        # The same id on every prompt_context log line of this request
+        # (app/context_budget.py). call_next runs the app in a task that copies
+        # this context, so the endpoint sees it.
+        request_id_var.set(rid)
 
         response = await call_next(request)
         response.headers["X-Request-ID"] = rid

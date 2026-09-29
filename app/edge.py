@@ -129,6 +129,36 @@ _MONEY_ADVICE = [
     r"\b(?:grow|double|multiply)\s+(?:my|our)\s+(?:money|savings|wealth)\b",
 ]
 
+# A personal request for money: "now give me five thousand loan for me i am in
+# crisis" (reported 2026-09-29, right after a Focus Plus answer). It named no
+# scheme, so the follow-up rewrite glued Focus Plus on and the DATA path asked
+# "which year / area?" for a Focus Plus analytics query nobody asked. The
+# assistant cannot give, lend or approve anything; it says so, then points at
+# the schemes that do offer support. Anchored on a FIRST-PERSON request for
+# money, never on the money noun alone: "how many loans were disbursed under CM
+# Elevate Legacy?" and "give me the amount disbursed" are untouched.
+_MONEY_NOUN = r"(?:loans?|money|cash|rupees?|funds?|financial\s+(?:help|aid|support|assistance))"
+_AMOUNT_WORDS = (r"(?:(?:rs\.?|inr|₹)\s*)?(?:[\d,]+(?:\.\d+)?\s*(?:k|lakhs?|lacs?|thousand|crores?)?|"
+                 r"(?:one|two|three|four|five|six|seven|eight|nine|ten|twenty|fifty|hundred|"
+                 r"thousand|lakh|lakhs|crore)(?:\s+(?:hundred|thousand|lakhs?|crores?))*)")
+_PERSONAL_REQUEST = [
+    # "give me five thousand loan", "lend me 5000 rupees", "send us money"
+    r"\b(?:give|lend|loan|send|grant|provide|pay|transfer|arrange|sanction|approve|release)\s+"
+    r"(?:me|us)\s+(?:a\s+|an\s+|some\s+)?(?:" + _AMOUNT_WORDS + r"\s+)?(?:rs\.?\s+|rupees?\s+)?"
+    + _MONEY_NOUN + r"\b",
+    # "a loan for me", "money for my family"
+    r"\b" + _MONEY_NOUN + r"\s+for\s+(?:me|myself|us|my\s+(?:family|son|daughter|wife|husband|"
+    r"mother|father|children|kids))\b",
+    # "I need a loan", "I want 5000 rupees", "can I get money"
+    r"\b(?:i|we)\s+(?:need|want|require|urgently\s+need)\s+(?:a\s+|an\s+|some\s+)?"
+    r"(?:" + _AMOUNT_WORDS + r"\s+)?(?:rs\.?\s+|rupees?\s+)?" + _MONEY_NOUN + r"\b",
+    r"\bcan\s+(?:i|we)\s+(?:get|have|borrow)\s+(?:a\s+|an\s+|some\s+)?(?:" + _AMOUNT_WORDS
+    + r"\s+)?(?:rs\.?\s+|rupees?\s+)?" + _MONEY_NOUN + r"\b",
+    # "I am in crisis", "we are in debt"
+    r"\b(?:i\s*(?:am|'m)|we\s*(?:are|'re))\s+in\s+(?:a\s+|great\s+|serious\s+|financial\s+)*"
+    r"(?:crisis|debt|trouble|distress|emergency|need)\b",
+]
+
 
 # A request for help with something ILLEGAL or harmful — "i want to rob a bank,
 # give me suggestions", "how to make fake job cards", "help me bribe the
@@ -237,7 +267,9 @@ _FOREIGN_PLACE = re.compile(
     r"italy|spain|portugal|netherlands|belgium|switzerland|austria|sweden|"
     r"norway|denmark|finland|poland|russia|ukraine|greece|hungary|romania|"
     r"czech(\s+republic)?|iceland|"
-    r"united\s+states(\s+of\s+america)?|\busa\b|\bu\.s\.a?\.?\b|america|canada|"
+    # "u.s." must not be the start of a longer dotted word ("Umiong U.s.t", a
+    # Focus Legacy producer group — all-PG run 2026-09-29)
+    r"united\s+states(\s+of\s+america)?|\busa\b|\bu\.s(?:\.a)?(?=\.?(?:[\s,;:?!)]|$))|america|canada|"
     r"mexico|brazil|argentina|chile|peru|colombia|venezuela|cuba|"
     r"australia|new\s+zealand|\bfiji\b|"
     r"africa|europe|south\s+america|north\s+america|antarctica|"
@@ -246,6 +278,43 @@ _FOREIGN_PLACE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+# A producer-group NAME the user labelled as one — "…named Rakkam China Banana
+# Group", "members in Umden Manipur Banana Pg" — is not a place. Five stored
+# Focus Legacy names hold a state or country word and were refused as
+# out-of-area (all-PG run 2026-09-29). Masked only for the out-of-area test; a
+# place written AFTER the name ("…producer groups in Assam") stays visible.
+_GROUP_WORD = r"(?:producer\s+groups?|p\.?\s*g\.?s?|group)"
+_NAMED_GROUP_SPAN = re.compile(
+    rf"\b{_GROUP_WORD}\s+(?:named|called)\s+(?P<name>[^?]*?)\s*[?.!]*\s*$", re.IGNORECASE)
+_MEMBERS_IN_GROUP_SPAN = re.compile(
+    rf"\bmembers?\s+(?:are\s+|were\s+|is\s+)?(?:there\s+)?(?:in|of)\s+(?P<name>[^?]*?\b{_GROUP_WORD}"
+    r"(?:[\s-]*\d+)?)\s*[?.!]*\s*$", re.IGNORECASE)
+_PLACE_AFTER = re.compile(r"\s(?:in|from|of|at|within)\s", re.IGNORECASE)
+# A Meghalaya VILLAGE can carry a state's name: "MANIPUR" is a village in Umling
+# block, Ri Bhoi (Focus Legacy all-villages run 2026-09-29). "… for X village" is
+# a village name, not the state.
+_NAMED_VILLAGE_SPAN = re.compile(
+    r"\b(?:in|for|of|at|to)\s+(?:the\s+)?(?P<name>[a-z0-9(&][\w().'&\- ]{0,60}?)\s+village\b", re.IGNORECASE)
+
+
+# What a scheme / year chip appends after the name ("… Group for Focus Legacy
+# across all financial years") — removed before the name spans are matched.
+_CHIP_SCOPE_TAIL = re.compile(
+    r"(?:\s*,?\s+(?:for|under|in|across)\s+(?:the\s+)?(?:focus\s+legacy|focus\s+plus|mgnrega|pmay-?g|"
+    r"cm\s+elevate(?:\s+legacy)?|all\s+of\s+meghalaya|all\s+(?:the\s+)?(?:financial\s+)?years(?:\s+combined)?)"
+    r"(?:\s+scheme)?)+\s*[?.!]*\s*$", re.IGNORECASE)
+
+
+def _mask_group_name(ql: str) -> str:
+    ql = _CHIP_SCOPE_TAIL.sub("", ql)
+    ql = _NAMED_VILLAGE_SPAN.sub(lambda m: m.group(0).replace(m.group("name"), " "), ql)
+    for rx in (_NAMED_GROUP_SPAN, _MEMBERS_IN_GROUP_SPAN):
+        m = rx.search(ql)
+        if m and not _PLACE_AFTER.search(" " + m.group("name") + " "):
+            return ql[:m.start("name")] + " " + ql[m.end("name"):]
+    return ql
+
+
 _MEGHALAYA_PLACE = re.compile(
     r"\b("
     r"meghalaya|"
@@ -452,7 +521,7 @@ STARTERS = [
 
 # Which edge replies carry the starter chips (a plain "thanks" / "bye" should not).
 _STARTER_KINDS = {"greeting", "identity", "capability", "money_advice", "profanity", "silly",
-                  "off_topic", "confused"}
+                  "off_topic", "confused", "personal_request"}
 
 # One consistent line for every "that's not something I do" case — an unrelated
 # topic, a general-knowledge question, or a place outside Meghalaya. Callers past
@@ -509,6 +578,21 @@ _RESPONSES = {
         "is eligible, what benefits they pay, how to apply, and the actual figures by "
         "district, block or year. If you'd like to know what any of those schemes "
         "offers, ask away."
+    ),
+    # A first-person request for money or a loan. Says plainly that the
+    # assistant cannot give, lend or approve money, then where support exists.
+    # Scheme facts only as the SME docs state them (CM Elevate Legacy records
+    # subsidy and loans; MGNREGA pays wages for work; Focus Plus is a cash
+    # benefit to farmers, not a loan).
+    "personal_request": (
+        "I'm sorry you're in a difficult spot. I can't give, lend or approve money — I'm "
+        "Megh One AI, an assistant that reports Meghalaya's scheme data and explains how "
+        "the schemes work; I can't process applications or payments. If you need support, "
+        "these schemes may help: MGNREGA (paid work for rural households), CM Elevate "
+        "(support for starting or growing an enterprise, with subsidy and bank or LIFCOM "
+        "loans), PMAY-G (rural housing) and Focus Plus (a cash benefit for farmers — not a "
+        "loan). Ask me \"who is eligible for CM Elevate?\" or \"how do I apply for "
+        "MGNREGA?\" and I'll explain."
     ),
     "thanks": ("You're welcome. Ask me anything else about MGNREGA, PMAY-G, "
                "Focus Plus, CM Elevate, Focus Legacy or CM Elevate Legacy in Meghalaya."),
@@ -761,6 +845,23 @@ def out_of_scope() -> dict:
     return _edge("off_topic")
 
 
+def is_personal_request(question: str) -> bool:
+    """A first-person request for money or a loan ("give me five thousand
+    loan for me"), see _PERSONAL_REQUEST."""
+    ql = (question or "").lower()
+    return any(re.search(p, ql) for p in _PERSONAL_REQUEST)
+
+
+def has_domain_vocabulary(question: str) -> bool:
+    """True when the text carries any scheme / place / measure word the
+    whitelist gate (step 6 below) or the scheme-intent exit (step 1) knows.
+    Used by pipeline's continuation check: a message with none of these
+    cannot continue a scheme conversation on vocabulary alone."""
+    ql = (question or "").lower()
+    return (any(re.search(w, ql) for w in _DOMAIN_WORDS)
+            or any(re.search(p, ql) for p in _SCHEME_STRONG))
+
+
 def detect_harmful(question: str) -> dict | None:
     """The refusal for a request for help with something illegal or harmful,
     or None. Separate from detect_edge_case so the pipeline can run it FIRST —
@@ -805,7 +906,8 @@ def detect_edge_case(question: str, has_context: bool = False) -> dict | None:
     #     neighbouring city, "all-India", or a foreign country/continent).
     #     Beats the scheme-intent early exit, unless a Meghalaya place is named
     #     too ("Meghalaya vs Assam").
-    _area = _OUT_OF_AREA.search(ql) or _FOREIGN_PLACE.search(ql)
+    _ql_area = _mask_group_name(ql)
+    _area = _OUT_OF_AREA.search(_ql_area) or _FOREIGN_PLACE.search(_ql_area)
     if _area and not _MEGHALAYA_PLACE.search(ql):
         # Name the place that was matched, and — when the user asked a yes/no
         # question ("will you answer for West Bengal data?") — open with the
@@ -846,6 +948,13 @@ def detect_edge_case(question: str, has_context: bool = False) -> dict | None:
     #     help me save" is a scheme question, however it is phrased.
     if not _SCHEME_NAMED.search(ql) and any(re.search(p, ql) for p in _MONEY_ADVICE):
         return _edge("money_advice", ql)
+
+    # 0e. A personal request for money ("give me five thousand loan for me, i
+    #     am in crisis"). Before the scheme-intent exit for the same reason as
+    #     0d ("lakh" alone reads as scheme intent), and whatever scheme was
+    #     discussed before: the assistant can give nobody a loan, in any scheme.
+    if is_personal_request(ql):
+        return _edge("personal_request", ql)
 
     # 1. Clear scheme intent → straight to the pipeline, skip every check.
     if any(re.search(p, ql) for p in _SCHEME_STRONG):

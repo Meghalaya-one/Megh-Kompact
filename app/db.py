@@ -30,6 +30,40 @@ class UnsafeSQLError(ValueError):
     """Raised when generated SQL fails the read-only / single-statement check."""
 
 
+class DatabaseUnavailableError(RuntimeError):
+    """megh_db could not be reached (VPN / network drop, connection refused or
+    lost, server out of connection slots). Not a problem with the question or
+    its SQL — the caller must say "try again", never repair the SQL or answer
+    from the reference documents instead (KI-025)."""
+
+
+# asyncpg's connection-class failures. A slow query's command_timeout
+# (asyncio.TimeoutError) is deliberately NOT here: it keeps its own 504 path.
+_CONNECTION_ERRORS: tuple[type[BaseException], ...] = (
+    OSError,                       # ConnectionRefused/Reset, WinError 121 "semaphore timeout"
+    asyncpg.exceptions.PostgresConnectionError,
+    asyncpg.exceptions.ConnectionDoesNotExistError,
+    asyncpg.exceptions.InterfaceError,
+    asyncpg.exceptions.TooManyConnectionsError,
+    asyncpg.exceptions.CannotConnectNowError,
+)
+
+
+def is_connection_error(e: BaseException) -> bool:
+    """True for a failure to reach / stay connected to megh_db, anywhere in the
+    exception's cause chain."""
+    seen = 0
+    while e is not None and seen < 6:
+        # TimeoutError is an OSError subclass (and IS asyncio.TimeoutError on
+        # 3.11): a slow query's timeout keeps its own 504 path, so it is excluded.
+        if isinstance(e, DatabaseUnavailableError) or (
+                isinstance(e, _CONNECTION_ERRORS) and not isinstance(e, (UnsafeSQLError, TimeoutError))):
+            return True
+        e = e.__cause__ or e.__context__
+        seen += 1
+    return False
+
+
 async def init_pool() -> None:
     """Build the megh_db pool. Best-effort: if the DB host is unreachable at
     startup (the 10.48.242.4 box flaps), log and carry on with `_pool = None` —

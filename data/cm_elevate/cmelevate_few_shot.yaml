@@ -939,18 +939,18 @@ sql_generation_examples:
 
 - question: What is the current application status distribution across CM Elevate?
   sql: |
-    SELECT COALESCE(data_verified, '(not recorded)') AS status, COUNT(*) AS applications
+    SELECT CASE WHEN LOWER(current_file_status) LIKE 'sendback%' THEN 'Sent back' WHEN current_file_status IS NULL THEN '(not recorded)' ELSE INITCAP(LOWER(current_file_status)) END AS status,
+           COUNT(*) AS applications
     FROM curated.v_cm_elevate
     GROUP BY 1
     ORDER BY applications DESC;
   tables:
   - curated.v_cm_elevate
   note: >
-    "Current status" / "application status" with no further qualifier is
-    data_verified, NOT current_file_status — the word "current" in the question is
-    not a cue for the current_file_status COLUMN. current_file_status only applies
-    when the question says "file status" or "workflow" explicitly (see the
-    "workflow file status breakdown" example below).
+    "Status" / "current status" / "application status" means current_file_status
+    (product decision 2026-09-28). The two send-back spellings are one bucket
+    (rule 7). Verification words (verified, valid, on hold, pending) stay on
+    data_verified — see the verification examples.
 
 - question: How many CM Elevate applicants have completed data verification in Ri Bhoi?
   sql: |
@@ -971,19 +971,18 @@ sql_generation_examples:
 
 - question: What is the status-wise applicant count for Piggery in Umshaken village?
   sql: |
-    SELECT COALESCE(data_verified, '(not recorded)') AS status, COUNT(*) AS applications
+    SELECT CASE WHEN LOWER(current_file_status) LIKE 'sendback%' THEN 'Sent back' WHEN current_file_status IS NULL THEN '(not recorded)' ELSE INITCAP(LOWER(current_file_status)) END AS status,
+           COUNT(*) AS applications
     FROM curated.v_cm_elevate
     WHERE scheme_name = 'Meghalaya Piggery Development Scheme'
-      AND lgd_village_name = 'UMSHAKEN'
+      AND village_code = 277617
     GROUP BY 1
     ORDER BY applications DESC;
   tables:
   - curated.v_cm_elevate
   note: >
-    "Status-wise ... count" is a GROUP BY over every data_verified value at the
-    named scope, never a single filtered count for one status guessed from the
-    scheme/village total — a village this small can still split across Valid /
-    On Hold / Invalid / Wrong / not-recorded.
+    "Status-wise ... count" is a GROUP BY over every current_file_status value at
+    the named scope (decided 2026-09-28), never a single filtered count.
 
 - question: How many applications have invalid or wrong data?
   sql: |

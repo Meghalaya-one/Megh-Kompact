@@ -487,3 +487,334 @@ def test_zero_crore_value_is_described_as_under_one_lakh():
     notes = p._cm_legacy_small_money_notes([{"scheme_name": "Spinning", "total_disbursed_cr": 0.0}])
     assert "under ₹0.01 crore" in notes[0]
     assert p._cm_legacy_small_money_notes([{"scheme_name": "X", "total_disbursed_cr": 0.5}]) == []
+
+
+# ── Use-case re-test 2026-09-29 (KI-166 / 167 / 168) and all-villages run ─────
+_V = "curated.v_cm_elevate_disbursement"
+
+
+def test_sanctioned_count_star_is_rewritten_to_count_sanctioned_amount():
+    # TC-14: "2,823 applications have been sanctioned" (true 2,820), 5 of 5 runs
+    sql = f"SELECT COUNT(*) AS sanctioned_records\nFROM {_V}\nLIMIT 1"
+    out = p._cm_legacy_sanctioned_count(
+        "How many applications have been sanctioned under CM Elevate Legacy for all of Meghalaya "
+        "across all financial years", [LEGACY], sql)
+    assert out == f"SELECT COUNT(sanctioned_amount) AS sanctioned_records\nFROM {_V}\nLIMIT 1"
+
+
+def test_sanctioned_question_with_a_plain_record_count_gets_the_sanctioned_count():
+    sql = f"SELECT COUNT(*) AS records FROM {_V} WHERE lgd_block = 'TIKRIKILLA' ORDER BY records DESC"
+    out = p._cm_legacy_sanctioned_count(
+        "How many sanctioned CM Elevate Legacy applications are there in Tikrikilla block?", [LEGACY], sql)
+    assert out == (f"SELECT COUNT(sanctioned_amount) AS sanctioned_records FROM {_V} "
+                   "WHERE lgd_block = 'TIKRIKILLA' ORDER BY sanctioned_records DESC")
+
+
+@pytest.mark.parametrize("question,sql", [
+    ("How many applications have not been sanctioned?",
+     f"SELECT COUNT(*) FILTER (WHERE sanctioned_amount IS NULL) AS not_sanctioned_records, COUNT(*) AS records FROM {_V}"),
+    ("Give me a district-wise summary of applications, sanctioned cases and total disbursement",
+     f"SELECT lgd_district, COUNT(*) AS records, COUNT(sanctioned_amount) AS sanctioned_records FROM {_V} GROUP BY 1"),
+    ("What is the total sanctioned amount?", f"SELECT ROUND(SUM(sanctioned_amount) / 1e7, 2) AS sanctioned_cr FROM {_V}"),
+    ("How many applications are recorded?", f"SELECT COUNT(*) AS records FROM {_V}"),
+    ("How many desanctioned applications are there?", f"SELECT COUNT(*) AS desanctioned FROM {_V}"),
+])
+def test_sanctioned_count_guard_leaves_other_measures_alone(question, sql):
+    assert p._cm_legacy_sanctioned_count(question, [LEGACY], sql) == sql
+
+
+def test_sanctioned_count_guard_is_cm_elevate_legacy_only():
+    sql = f"SELECT COUNT(*) AS sanctioned_records FROM {_V}"
+    assert p._cm_legacy_sanctioned_count("How many sanctioned?", ["PMAY-G"], sql) == sql
+
+
+def test_unrequested_limit_on_a_scheme_ranking_is_dropped():
+    # TC-13: LIMIT 10 cut 3 of the 13 schemes; the answer called row 10 the lowest
+    sql = (f"SELECT scheme_name, COUNT(*) AS records FROM {_V}\n"
+           "GROUP BY scheme_name\nORDER BY records DESC\nLIMIT 10")
+    out = p._cm_legacy_unrequested_limit(
+        "Which schemes have the highest number of applications in CM Elevate Legacy?", [LEGACY], sql)
+    assert out == sql[:sql.index("\nLIMIT 10")]
+
+
+@pytest.mark.parametrize("question,sql", [
+    ("Which scheme has the highest number of applications?",
+     f"SELECT scheme_name, COUNT(*) r FROM {_V} GROUP BY 1 ORDER BY r DESC LIMIT 1"),
+    ("Top 5 schemes by applications", f"SELECT scheme_name, COUNT(*) r FROM {_V} GROUP BY 1 ORDER BY r DESC LIMIT 5"),
+    ("Show the 3 highest districts", f"SELECT lgd_district, COUNT(*) r FROM {_V} GROUP BY 1 ORDER BY r DESC LIMIT 3"),
+    ("How many applications are recorded?", f"SELECT COUNT(*) AS records FROM {_V} LIMIT 1"),
+])
+def test_requested_or_ungrouped_limits_are_kept(question, sql):
+    assert p._cm_legacy_unrequested_limit(question, [LEGACY], sql) == sql
+
+
+_TIK_ROWS = ([{"lgd_village_name": f"V{i}", "village_code": 1000 + i, "records": 1} for i in range(24)]
+             + [{"lgd_village_name": f"W{i}", "village_code": 2000 + i, "records": 2} for i in range(11)]
+             + [{"lgd_village_name": "BOROBATAPARA", "village_code": 273257, "records": 13}])
+
+
+@pytest.mark.parametrize("said,fixed", [
+    ("while 20 villages each have 1 record and", "while 24 villages each have 1 record and"),
+    ("Nine villages each have 2 records.", "11 villages each have 2 records."),
+    ("24 villages each have 1 record.", "24 villages each have 1 record."),
+])
+def test_each_have_counts_are_recomputed_from_every_row(said, fixed):
+    # TC-34: "20 villages each have 1 record" against a true 24, 5 of 5 runs
+    assert p._cml_fix_each_have_counts(said, _TIK_ROWS) == fixed
+
+
+def test_each_have_fix_needs_exactly_one_count_column():
+    rows = [{"v": "A", "records": 1, "sanctioned_records": 1}, {"v": "B", "records": 2, "sanctioned_records": 1}]
+    assert p._cml_fix_each_have_counts("5 villages each have 1 record", rows) == "5 villages each have 1 record"
+
+
+def test_no_village_records_are_requeried_in_the_same_scope_and_stated(monkeypatch):
+    import asyncio
+    sent = []
+
+    async def fake_run(sql):
+        sent.append(sql)
+        return [{"n": 6}] if "COUNT(*) AS n" in sql else [{"v": None}]
+    monkeypatch.setattr(p, "run_readonly", fake_run)
+    sql = (f"SELECT lgd_village_name, village_code,\n       COUNT(*) AS records\nFROM {_V}\n"
+           "WHERE lgd_block = 'TIKRIKILLA'\n  AND entity_type <> 'Unresolved'\n"
+           "GROUP BY lgd_village_name, village_code\nORDER BY records DESC")
+    ans = asyncio.run(p._cm_legacy_answer_guarantees(
+        "Show me the no of applications mapped to each village in Tikrikilla block", sql, _TIK_ROWS,
+        "Tikrikilla block has 89 applications in 42 villages.", {"block": "TIKRIKILLA"}))
+    assert sent[0] == (f"SELECT COUNT(*) AS n FROM {_V}\nWHERE lgd_block = 'TIKRIKILLA'\n"
+                       "  AND entity_type = 'Unresolved'")
+    assert ans.endswith("A further 6 records in Tikrikilla block have no village code, so they are not in "
+                        "the village list (counted in block and district totals).")
+
+
+def test_exact_small_amount_replaces_under_one_lakh_wording(monkeypatch):
+    import asyncio
+    sent = []
+
+    async def fake_run(sql):
+        sent.append(sql)
+        return [{"v": 0}]
+    monkeypatch.setattr(p, "run_readonly", fake_run)
+    sql = (f"SELECT ROUND(SUM(total_disbursement) / 1e7, 2) AS total_disbursed_cr FROM {_V} "
+           "WHERE village_code = 277592 GROUP BY lgd_village_name ORDER BY total_disbursed_cr DESC LIMIT 1")
+    ans = asyncio.run(p._cm_legacy_answer_guarantees(
+        "What is the total disbursement amount for Umtham village?", sql, [{"total_disbursed_cr": 0.0}],
+        "The total disbursement for Umtham village is under ₹0.01 crore.", {"village": "Umtham"}))
+    assert sent == [f"SELECT SUM(total_disbursement) AS v FROM {_V} WHERE village_code = 277592"]
+    assert ans == "The total disbursement for Umtham village is ₹0."
+
+
+def test_exact_rupees_are_added_to_a_small_crore_figure(monkeypatch):
+    import asyncio
+
+    async def fake_run(sql):
+        return [{"v": 125000}]
+    monkeypatch.setattr(p, "run_readonly", fake_run)
+    ans = asyncio.run(p._cm_legacy_answer_guarantees(
+        "What is the total disbursement for Nongthymmai village?",
+        f"SELECT ROUND(SUM(total_disbursement) / 1e7, 2) AS total_disbursed_cr FROM {_V} WHERE village_code = 277681",
+        [{"total_disbursed_cr": 0.01}], "₹0.01 crore has been disbursed for Nongthymmai village.",
+        {"village": "Nongthymmai"}))
+    assert ans == "₹0.01 crore (₹1,25,000) has been disbursed for Nongthymmai village."
+
+
+@pytest.mark.parametrize("v,s", [(0, "₹0"), (999, "₹999"), (62500, "₹62,500"), (125000, "₹1,25,000"),
+                                 (1950500, "₹19,50,500"), (12345678.5, "₹1,23,45,678.50")])
+def test_indian_rupee_grouping(v, s):
+    assert p._cml_inr(v) == s
+
+
+def test_place_name_misspelling_is_corrected_and_other_names_left():
+    display = {"village": "Rongchigre", "block": "SELSELLA", "district": "West Garo Hills"}
+    assert p._cml_fix_place_spelling("1 application in Rongchigre village, Sellsella block, West Garo Hills.",
+                                     display) == "1 application in Rongchigre village, Selsella block, West Garo Hills."
+    assert p._cml_fix_place_spelling("Tikrikilla block: BOROBATAPARA 13, TIKRIKILLA 9.", {"block": "TIKRIKILLA"}) \
+        == "Tikrikilla block: BOROBATAPARA 13, TIKRIKILLA 9."
+
+
+def test_twin_village_chips_rank_by_cm_elevate_legacy_records(monkeypatch):
+    # all-villages run: "Nongthymmai" had 10 registry matches; the JIRANG one holds the records
+    import asyncio
+    queries = []
+
+    async def fake_fetch(sql, params):
+        queries.append(sql)
+        return [{"village_code": 277681}]
+    monkeypatch.setattr(p, "fetch_rows", fake_fetch)
+    cands = [{"village_code": c, "name": "NONGTHYMMAI"} for c in (276411, 276536, 276691, 277052, 277681)]
+    ranked = asyncio.run(p._fl_rank_villages([LEGACY], cands))
+    assert ranked[0]["village_code"] == 277681
+    assert "curated.v_cm_elevate_disbursement" in queries[0]
+    assert asyncio.run(p._fl_rank_villages(["PMAY-G"], cands)) == cands
+
+
+def test_chip_pin_keeps_the_same_block_twin_holding_cm_elevate_legacy_records(monkeypatch):
+    import asyncio
+
+    async def fake_fetch(sql, params):
+        if "dim_geography" in sql:
+            return [{"village_code": 1, "lgd_village_name": "DEWSAW", "lgd_block": "MAIRANG",
+                     "lgd_district": "EASTERN WEST KHASI HILLS"},
+                    {"village_code": 2, "lgd_village_name": "DEWSAW", "lgd_block": "MAIRANG",
+                     "lgd_district": "EASTERN WEST KHASI HILLS"}]
+        assert "v_cm_elevate_disbursement" in sql
+        return [{"village_code": 2}]
+    monkeypatch.setattr(p, "fetch_rows", fake_fetch)
+    pin = asyncio.run(p._mgnrega_village_chip_pin(
+        "How many CM Elevate Legacy applications are recorded in DEWSAW village, MAIRANG block, "
+        "EASTERN WEST KHASI HILLS across all financial years", "CM Elevate Legacy"))
+    assert pin["village_code"] == 2
+
+
+def test_row_label_misspelling_is_corrected_in_a_block_breakdown():
+    # all-blocks run: "Mawsynrut" for the MAWSHYNRUT row of West Khasi Hills
+    rows = [{"lgd_block": b, "records": n} for b, n in
+            [("NONGSTOIN", 135), ("MAWSHYNRUT", 31), ("SHALLANG", 26), ("RAMBRAI", 13), ("RI MULIANG", 12)]]
+    out = p._cml_fix_place_spelling("Nongstoin, Mawsynrut, Shallang, Rambrai and Ri Muliang: 135, 31, 26, 13, 12.",
+                                    {"district": "West Khasi Hills"}, rows)
+    assert out == "Nongstoin, Mawshynrut, Shallang, Rambrai and Ri Muliang: 135, 31, 26, 13, 12."
+
+
+def test_a_label_that_is_another_known_name_is_never_respelled():
+    rows = [{"lgd_block": "UMSNING", "records": 3}, {"lgd_block": "UMLING", "records": 2}]
+    assert p._cml_fix_place_spelling("UMSNING 3 and UMLING 2.", {}, rows) == "UMSNING 3 and UMLING 2."
+
+
+def test_place_literals_beside_a_pinned_village_code_are_dropped():
+    # all-villages run: the ward's block written into lgd_village_name -> 0 records for a ward with 1
+    sql = (f"SELECT COUNT(*) AS records FROM {_V} WHERE lgd_village_name = 'WILLIAM NAGAR-MUNICIPAL BOARD' "
+           "AND village_code = 70681 AND UPPER(lgd_block) = 'WILLIAM NAGAR-MUNICIPAL BOARD' LIMIT 1000")
+    assert p._focus_legacy_village_code_only([LEGACY], {"village_code": 70681}, sql) == \
+        f"SELECT COUNT(*) AS records FROM {_V} WHERE village_code = 70681 LIMIT 1000"
+
+
+def test_focus_legacy_keeps_its_village_name_literal():
+    sql = "SELECT 1 FROM v WHERE lgd_village_name = 'X' AND village_code = 7 AND lgd_block = 'B'"
+    assert p._focus_legacy_village_code_only(["Focus Legacy"], {"village_code": 7}, sql) == \
+        "SELECT 1 FROM v WHERE lgd_village_name = 'X' AND village_code = 7"
+
+
+_UMSNING = [{"scheme_name": s, "records": n} for s, n in [
+    ("Meghalaya Piggery Development Scheme", 27), ("Meghalaya Poultry Farming Scheme", 24),
+    ("Meghalaya Dairy Development Scheme", 16), ("Meghalaya Sericulture & Weaving Scheme (spinning)", 15),
+    ("Prime Agriculture Response Vehicle Scheme", 13), ("Meghalaya Sericulture & Weaving Scheme(weaving)", 6),
+    ("Meghalaya Agriculture Warehouse Scheme", 3), ("Meghalaya Sports & Wellness Scheme", 1),
+    ("Prime Tourism Vehicle Scheme", 1)]]
+
+
+def test_breakdown_figures_without_their_names_are_rebuilt_under_the_headline():
+    # all-blocks run: "The remaining schemes show 24, 16, 15, 13, 6, 3, 1, and 1 records respectively"
+    ans = ("Umsning block has 106 total applications across nine schemes, with the Meghalaya Piggery "
+           "Development Scheme holding the highest count at 27 records. The remaining schemes show 24, 16, "
+           "15, 13, 6, 3, 1, and 1 records respectively.")
+    out = p._cml_complete_list("How many CM Elevate Legacy applications are there under each scheme in "
+                               "Umsning block?", ans, _UMSNING)
+    assert out.startswith("Umsning block has 106 total applications across nine schemes, with the Meghalaya "
+                          "Piggery Development Scheme holding the highest count at 27 records.\n\n"
+                          "Applications by scheme (9): Piggery Development Scheme 27; Poultry Farming Scheme 24;")
+    assert out.endswith("Sports & Wellness Scheme 1; Prime Tourism Vehicle Scheme 1. Total 106.")
+
+
+def test_a_breakdown_that_names_every_figure_is_left_alone():
+    rows = [{"lgd_block": "RONGRAM", "records": 206}, {"lgd_block": "TIKRIKILLA", "records": 95}]
+    ans = "RONGRAM block holds 206 records, followed by TIKRIKILLA with 95."
+    assert p._cml_complete_list("Show me the number of applications in each block of West Garo Hills.",
+                                ans, rows) == ans
+
+
+@pytest.mark.parametrize("rows,ans", [
+    ([{"financial_year": "2024-2025", "records": 2291}, {"financial_year": "2025-2026", "records": 137}],
+     "FY 2024-25 holds 2,291 records and FY 2025-26 holds 137."),
+    ([{"scheme_name": "A", "total_disbursed_cr": 1.5}, {"scheme_name": "B", "total_disbursed_cr": 2.5}],
+     "Figures are 1.50 and 2.50 respectively."),
+])
+def test_year_and_money_breakdowns_are_not_rebuilt(rows, ans):
+    assert p._cml_complete_list("How many applications for each financial year / each scheme?", ans, rows) == ans
+
+
+_PURAKHASIA = [{"lgd_village_name": n, "village_code": 273000 + i, "records": v} for i, (n, v) in enumerate([
+    ("RAPANGPANGGIRI", 6), ("GOPINATHKILLA", 5), ("DINAPARA", 3), ("MARENGPARA", 3), ("SALMANPARA", 3),
+    ("DINGAMPARA", 2), ("BALIJHORA", 1), ("DAMALGRE", 1), ("DARUGRE", 1), ("JARANGPARA", 1), ("KIDAPARA", 1),
+    ("NACHILPARA", 1), ("RIMTANGPARA", 1), ("SONAJURI", 1)])]
+
+
+def test_garbled_village_breakdown_with_a_false_claim_is_rebuilt():
+    # all-blocks run: "1 record at each of the other 13 villages" (8 have 1), names missing, total 30 never stated
+    ans = ("Purakhasia block shows 14 villages with CM Elevate Legacy applications, ranging from 6 records at "
+           "Rapangpanggiri down to 1 record at each of the other 13 villages. The village-level record counts "
+           "are 6, 5, 3, 3, 3, 2, 1, 1, 1, 1, 1, 1, 1, and 1 respectively.")
+    out = p._cml_village_breakdown(ans, _PURAKHASIA, {"block": "PURAKHASIA"})
+    assert out.startswith("30 applications are mapped to 14 villages in Purakhasia block.\n\n"
+                          "Applications by village (14): Rapangpanggiri 6; Gopinathkilla 5; Dinapara 3;")
+    assert out.endswith("Rimtangpara 1; Sonajuri 1.")
+
+
+def test_village_breakdown_missing_only_its_total_gets_a_headline():
+    ans = "Rapangpanggiri leads with 6 records, followed by Gopinathkilla with 5."
+    assert p._cml_village_breakdown(ans, _PURAKHASIA, {"block": "PURAKHASIA"}) == \
+        "30 applications are mapped to 14 villages in Purakhasia block. " + ans
+
+
+def test_a_correct_village_breakdown_is_left_alone():
+    ans = ("Purakhasia block has 30 applications in 14 villages. Rapangpanggiri holds the most with 6, "
+           "and 8 villages each have 1 record.")
+    assert p._cml_village_breakdown(ans, _PURAKHASIA, {"block": "PURAKHASIA"}) == ans
+
+
+def test_raw_fallback_row_dump_becomes_a_sentence():
+    # all-constituencies run: the officer got "0.58 total disbursed cr."
+    row = {"total_disbursed_cr": 0.58}
+    assert p._deterministic_answer([row]) == "0.58 total disbursed cr."
+    assert p._cml_single_row_sentence(row, {"constituency": "MAWKYNREW"}) == \
+        "Mawkynrew constituency: ₹0.58 crore disbursed under CM Elevate Legacy across all financial years."
+    assert p._cml_single_row_sentence({"records": 95, "total_disbursed_cr": 2.8},
+                                      {"block": "TIKRIKILLA", "year": "FY 2024-25"}) == \
+        "Tikrikilla block: 95 applications; ₹2.80 crore disbursed under CM Elevate Legacy in FY 2024-25."
+
+
+def test_disbursement_note_forbids_a_split_the_result_does_not_carry():
+    sql = "SELECT ROUND(SUM(total_disbursement) / 1e7, 2) AS total_disbursed_cr FROM v"
+    notes = p._cm_legacy_answer_notes(sql, [{"total_disbursed_cr": 0.58}])
+    assert any("do not mention subsidy or loan at all" in n for n in notes)
+    both = p._cm_legacy_answer_notes(sql, [{"total_disbursed_cr": 1, "subsidy_cr": 0.6, "loan_cr": 0.4}])
+    assert any("give all three" in n for n in both) and not any("do not mention subsidy" in n for n in both)
+
+
+def test_urban_body_maps_to_the_cm_elevate_legacy_stored_block(monkeypatch):
+    # all-blocks run: "Tura Municipal Board" refused as outside Meghalaya
+    import asyncio
+    monkeypatch.setattr(p, "_CML_BLOCKS", ["RONGRAM", "TIKRIKILLA", "TURA MUNICIPAL BOARD",
+                                            "WILLIAM NAGAR-MUNICIPAL BOARD"])
+    assert asyncio.run(p._cm_elevate_block_from_mention("Tura Municipal Board", [LEGACY])) == "TURA MUNICIPAL BOARD"
+    resolved, display = {"block": "TURA MUNICIPAL BOARD-MUNICIPAL BOARD"}, {}
+    asyncio.run(p._cm_elevate_blocks_to_data("How many applications in Tura Municipal Board?",
+                                             resolved, display, LEGACY))
+    assert resolved["block"] == "TURA MUNICIPAL BOARD"
+
+
+def test_group_by_on_an_unselected_column_is_dropped():
+    # final pass: CHIOKGRE — invalid per-year grouping repeated by the repair model 4 times
+    sql = (f"SELECT COUNT(*) AS records FROM {_V} WHERE village_code = 275499 "
+           "GROUP BY COALESCE(financial_year_short, '(no financial year)') ORDER BY financial_year_short NULLS LAST")
+    assert p._cm_legacy_unselected_group_by([LEGACY], sql) == \
+        f"SELECT COUNT(*) AS records FROM {_V} WHERE village_code = 275499"
+
+
+@pytest.mark.parametrize("sql", [
+    f"SELECT COALESCE(financial_year_short, '(none)') AS financial_year, COUNT(*) AS records FROM {_V} "
+    "GROUP BY COALESCE(financial_year_short, '(none)') ORDER BY 1",
+    f"SELECT lgd_block, COUNT(*) AS records FROM {_V} WHERE lgd_district = 'X' GROUP BY lgd_block ORDER BY records DESC",
+    f"SELECT scheme_name, COUNT(*) r FROM {_V} GROUP BY 1 ORDER BY r DESC",
+])
+def test_real_breakdowns_keep_their_group_by(sql):
+    assert p._cm_legacy_unselected_group_by([LEGACY], sql) == sql
+
+
+def test_verifier_block_district_complaint_on_a_pinned_village_is_discarded():
+    # final pass: DARUGRE / MARENGPARA, Purakhasia — rejected 4 times after the chip
+    issue = ("Check 2: The RESOLVED ENTITIES block lists 'village_code = 273879' (DARUGRE), but the question "
+             "explicitly names 'PURAKHASIA block' and 'SOUTH WEST GARO HILLS' as required geographic filters.")
+    sql = f"SELECT COUNT(*) AS records FROM {_V} WHERE village_code = 273879"
+    assert p._verifier_village_code_complaint_is_false(issue, [LEGACY], {"village_code": 273879}, sql)
+    assert not p._verifier_village_code_complaint_is_false(issue, [LEGACY], {"village_code": 1}, sql)

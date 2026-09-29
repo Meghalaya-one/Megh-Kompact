@@ -417,6 +417,34 @@ class Settings(BaseSettings):
     # in-memory window) — keeps the common case (recent turn already in
     # session_store) free of an extra embed + Qdrant round trip.
     CONTEXT_MEMORY_MIN_SESSION_TURNS: int = 2
+    # Follow-up rewrite evidence tiers (context_manager.build_rewrite_evidence).
+    # Tier 1, the previous turn's structured filters, is always sent and is
+    # a single line. Tiers 2 and 3 are sent only when the follow-up points INTO
+    # the previous result ("the top one", "that block"):
+    #   Tier 2  a deterministic summary of the previous result rows;
+    #   Tier 3  a sentence-bounded excerpt of the previous answer, used only
+    #           when there were no rows (a knowledge answer).
+    # These replace the old fixed prev.answer[:300] slice.
+    # Shared conversation state across workers (app/session_sync.py, KI-028).
+    # Every request reads the durable snapshot in app.conversations and writes
+    # the next revision back (awaited, bounded by the timeout). Off: per-worker
+    # memory only, which was the behaviour before 2026-09-26.
+    CONTEXT_STATE_SHARED: bool = True
+    CONTEXT_STATE_SYNC_TIMEOUT_SECONDS: float = 1.0
+    CONTEXT_PREV_RESULT_MAX_TOKENS: int = 120
+    CONTEXT_PREV_ANSWER_MAX_TOKENS: int = 120
+
+    # ── Prompt budgets (approximate input tokens; app/context_budget.py) ──
+    # Each is the served --max-model-len minus that call's max_tokens
+    # reservation (docs/INFERENCE_REQUIREMENTS.md):
+    #   qwen-model   16,384 - 1,024 = 15,360  (SQL generation and repair)
+    #   qwen4-deploy  8,192 -   200 =  7,992  (classifier roles: rewrite, verifier)
+    # qwen35-9b's max-model-len is not recorded in the repo, so the composer
+    # budget is 0 (unchecked). These budgets log and warn only; nothing is
+    # pruned (see context_budget's docstring for why).
+    PROMPT_BUDGET_SQL_TOKENS: int = 15360
+    PROMPT_BUDGET_CLASSIFIER_TOKENS: int = 7992
+    PROMPT_BUDGET_COMPOSER_TOKENS: int = 0
 
     class Config:
         env_file = ".env"

@@ -1056,7 +1056,7 @@ dimensions:
     - canonical: "House Sanctioned"
       records: 2057
       stage_order: 3
-      aliases: ["sanctioned", "sanctioned only", "approved not started", "not started", "yet to start", "sanction stage"]
+      aliases: ["sanctioned", "sanctioned only", "approved not started", "not started", "yet to start", "sanction stage", "sanctioned stage", "sanctioned status"]
     - canonical: "Existing site(Old House)"
       records: 73
       stage_order: 2

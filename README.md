@@ -1,22 +1,28 @@
-# Meghalaya NL Assistant — MGNREGA + PMAY-G
+# Meghalaya NL Assistant (Megh One AI)
 
-One FastAPI service (`app/`) that answers natural-language questions about
-Meghalaya's **MGNREGA** and **PMAY-G** scheme data:
+> **Start here:** [CLAUDE.md](CLAUDE.md) holds the working rules and the documentation map, and
+> [docs/PROJECT_CONTEXT.md](docs/PROJECT_CONTEXT.md) is the onboarding overview. This README is
+> the quick-start only.
+
+One FastAPI service (`app/`) that answers natural-language questions about six Meghalaya scheme
+datasets: **MGNREGA**, **PMAY-G**, **Focus Plus**, **CM Elevate**, **Focus Legacy** and
+**CM Elevate Legacy**.
 
 - **Data questions** → generates a read-only SQL query against the curated
   `megh_db` star schema, runs it, and composes a short answer.
 - **Scheme-knowledge questions** ("who is eligible for PMAY-G?", "what documents
   are required?") → retrieves from a Qdrant knowledge base built from the
-  `data/` reference docs, reranks, and answers from the passages.
+  `data/` reference docs and answers from the passages. The reranker is currently
+  disabled.
 - **Edge input** (greetings, "who are you", off-topic) → an instant canned reply,
   no model call.
 
-Scheme selection (MGNREGA / PMAY-G / both) happens **inside the pipeline**, not in
-the URL. The three former per-scheme services (`unified-data`, `cm-elevate`,
-`focus`) and the gateway have been removed.
+Scheme selection happens **inside the pipeline**, not in the URL. The three former per-scheme
+services (`unified-data`, `cm-elevate`, `focus`) and the gateway have been removed.
 
-All model inference is remote — the service calls a self-hosted OpenAI-compatible
-Qwen gateway and does no local inference.
+Chat model inference is remote: the service calls a self-hosted OpenAI-compatible Qwen gateway.
+Embeddings run locally on CPU (fastembed `bge-small-en-v1.5`), because the gateway has no
+embedding model deployed.
 
 ## Layout
 
@@ -48,14 +54,14 @@ meghalaya/
 │   ├── admin.html             admin console         (/admin-ui)
 │   └── Meghalaya_UnifiedPortal_UI.html   portal     (/)
 ├── data/                      SME-curated inputs, read at startup
-│   ├── mgnrega/               few-shot, FK, entity-resolver YAML
-│   ├── pmay/                  same, for PMAY-G
+│   ├── mgnrega/ pmay/ focus_plus/ cm_elevate/ focus_legacy/ cm_elevate_legacy/
+│   │                          per-scheme SME YAML (few-shot, FK, entity resolver, …) + README
 │   ├── reference/             scheme reference + FAQ docs, KPI workbooks
-│   ├── schema/                schema_for_developers.md
+│   ├── schema/                schema_for_developers.md (MGNREGA + PMAY-G only)
 │   └── web/                   scraped background docs (KB source)
-├── docs/                      ARCHITECTURE.md · DATA_MODEL.md · INFERENCE_REQUIREMENTS.md
-├── deploy/                    nginx conf + systemd unit
-├── tests/                     smoke tests
+├── docs/                      project documentation — see CLAUDE.md for the map
+├── deploy/                    nginx conf (+ ModSecurity), systemd unit, SQL role/retention scripts
+├── tests/                     regression tests (see docs/TESTING.md)
 ├── certs/                     internal CA bundle          (gitignored)
 ├── logs/                      audit JSONL + uvicorn out   (gitignored)
 ├── archive/                   reference zip, rotated .env backups (gitignored)
@@ -100,10 +106,14 @@ the go-live security checklist.
 
 ## Models (self-hosted Qwen gateway, `10.48.242.4`)
 
+Current as of 2026-09-26, from `app/config.py`. Details are in
+[docs/AI_PIPELINE.md §0](docs/AI_PIPELINE.md).
+
 | Role | Model |
 | --- | --- |
-| Scheme + intent classify, SQL generation | `qwen-model` (qwen3-coder-30b-fp8) |
+| SQL generation (+ repair) | `qwen-model` (qwen3-coder-30b-fp8) |
+| Scheme / intent / entity classification, follow-up rewrite, SQL verifier | `qwen4-deploy` (Qwen3-4B) |
 | Answer composition | `qwen35-9b` |
-| KB embeddings | `qwen3-embedding` |
-| KB reranking | `qwen3-reranker` |
+| KB embeddings | local fastembed `BAAI/bge-small-en-v1.5` (`qwen3-embedding` not used) |
+| KB reranking | `qwen3-reranker`, **disabled** (`RERANKER_ENABLED=False`) |
 | Voice input | `qwen3-asr` |

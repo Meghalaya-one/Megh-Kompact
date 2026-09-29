@@ -267,3 +267,25 @@ Re-run the use cases. After the Issue 1 fix, TC-26 should match the raw file wit
 and so should the Songsak block option in TC-28. The bot already queries `lgd_block`, which is the
 column being corrected. Issue 2 does not change any of the 28 results but should be decided before
 name search is released. The bot team can re-run the test harness on request.
+
+## 2026-09-29 — mis-encoded producer-group names (found by the all-PG bulk run)
+
+Six `pg_name` values are double-encoded UTF-8 (mojibake) in **both** `Focus Legacy to share to
+BLH.csv` and `curated.v_focus_legacy`, so this is a source-data defect, not an ingestion error:
+
+| pg_id | stored name (as stored) |
+|---|---|
+| PG-FOCUS-NGH-6415 | `AÃ£Æ’Ã¦â€™Ã£Â¢Ã¢â€šÂ¬Ã¥Â¡Ã£Æ’Ã¢â‚¬Å¡Ã£â€šÃ¢Â·we Producer Group` |
+| PG-FOCUS-NGH-10785 | `Sildoe Producer GroupÃ£Æ’…s` |
+| PG-FOCUS-EKH-15157 | `MawleiÃ±` |
+| PG-FOCUS-WKH-9993 | `MawehdÃ n` |
+| PG-LAMP-EJH-9026 | `ThaiÃ£Æ’…lang Handicrafts` |
+| PG-LAMP-NGH-5019 | `KuÃ£Æ’…` |
+
+**Ask:** correct the names at source (likely `Mawleiñ`, `Mawehdàn`, and a curly apostrophe or
+dot in the others). The bot now matches them only against themselves (KI-155), but an officer
+cannot type them.
+
+Also re-confirmed on 2026-09-29: DB = raw row for row on 14,569 rows (pg_id, members, amount,
+date, FY, district, block, village, constituency); 88 rows have no block in either source.
+

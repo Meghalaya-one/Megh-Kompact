@@ -1,293 +1,406 @@
-# nlp-service — Architecture & Infrastructure
+# Architecture — Megh One AI (`nlp-service`)
 
-One FastAPI service answers natural-language questions about Meghalaya's
-**MGNREGA** and **PMAY-G** schemes. It generates read-only SQL against the
-curated `megh_db` star schema for numbers, and retrieves from a small Qdrant
-knowledge base for "how the scheme works" questions. All model inference is
-remote — the service itself runs no models.
+*Reconciled against the code on 2026-09-26 (commit `7064ab6`). Replaces the earlier two-scheme
+version of this file: that version described MGNREGA and PMAY-G only, `backend/` paths, and model
+roles that have since moved.*
+*Labels: **VERIFIED** (code, config or test) · **INFERRED** · **UNKNOWN — NEEDS VERIFICATION** · **PLANNED**.*
 
-There is no longer any per-scheme service or gateway: scheme selection
-(MGNREGA / PMAY-G / both) happens inside the pipeline, not in the URL.
+The AI chain in detail: [AI_PIPELINE.md](AI_PIPELINE.md). The database: [DATA_MODEL.md](DATA_MODEL.md).
 
 ---
 
-## Infrastructure
-
-### Application tier — 2× ESDS VMs
-
-| | VM #1 | VM #2 |
-|---|---|---|
-| vCores | 24 | 24 |
-| RAM | 256 GB | 256 GB |
-| Storage | 1 TB @ 5000 IOPS | 1 TB @ 5000 IOPS |
-| GPU | 2× H200 (141 GB HBM3e each) | unconfirmed |
-| OS | Ubuntu | Ubuntu |
-
-Shared: 100 Mbps internet, 2 public IPs, vFirewall (25 SSL-VPN + 2 site-to-site
-tunnels), antivirus, 10 TB block storage, 5 TB backup, Enlight AIOps monitoring ×2.
-
-> **The application-tier GPUs are unused by this workload.** `nlp-service` does
-> zero local inference — every model call is a network hop to the inference box
-> below. The H200s only become relevant if a model is later self-hosted on the
-> ESDS side instead of using the remote gateway.
-
-### Data + inference tier — `10.48.242.4` (pre-existing, not part of the ESDS quote)
-
-| Component | Detail |
-|---|---|
-| Model gateway | OpenAI-compatible (vLLM). `qwen-model` = **qwen3-coder-30b-fp8** (classify / intent / SQL-gen), `qwen35-9b` (answer composer), `qwen3-embedding`, `qwen3-reranker`, `qwen3-asr` |
-| PostgreSQL | 18.4, database `megh_db` — curated MGNREGA + PMAY-G star schema |
-| Qdrant | vector DB, port `6333` — the scheme knowledge base |
-| pgAdmin4 | admin UI, port `8080` |
-| TLS | self-signed cert issued by "Enlight AIOps" — trust the CA bundle via `AI_MODEL_CA_BUNDLE_PATH` |
-
----
-
-## Request path
+## 1. Repository structure (VERIFIED)
 
 ```
-client
-  │  HTTP :80  (TLS :443 to be added — see nginx conf)
-  ▼
-nginx (one per app VM)                    deploy/nginx/nginx-nlpservice.conf
-  │  proxy_pass 127.0.0.1:8300
-  ▼
-uvicorn  backend.main:app  --workers 2    deploy/systemd/megh-nlpservice.service
-  │
-  ├── asyncpg pool (10–30) ───────────────►  PostgreSQL  megh_db   @ 10.48.242.4:5432
-  ├── httpx AsyncClient ──────────────────►  Qwen gateway          @ 10.48.242.4/openai/v1
-  └── AsyncQdrantClient ──────────────────►  Qdrant                @ 10.48.242.4:6333
+meghalaya/
+├── CLAUDE.md                  session rules + doc map (read first)
+├── app/                       the FastAPI service (package `app`)
+│   ├── main.py                app, lifespan startup, /health, /metrics, static UI routes
+│   ├── config.py              every setting (pydantic-settings, reads .env)
+│   ├── pipeline.py            ~8,400 lines — the whole routing + NL→SQL orchestration
+│   ├── edge.py                regex edge layer (greetings, off-topic, harmful, identity)
+│   ├── prompt_builder.py      SQL / repair / verifier prompt assembly
+│   ├── schema_context.py      hand-written per-scheme TABLES / RULES / VOCAB prompt blocks
+│   ├── schema_introspect.py   live information_schema + semantic.* catalogue → prompt blocks
+│   ├── annotations.py         loads few-shot + FK YAML from data/; IDF few-shot ranking
+│   ├── entity_resolver.py     district/block/year/AC/village resolution (YAML + live DB)
+│   ├── llm.py                 one httpx client; all model roles; concurrency gate
+│   ├── db.py                  asyncpg pool; run_readonly() guard for generated SQL
+│   ├── rag.py · kb_ingest.py · vectorstore.py · local_embed.py   RAG path + KB ingest
+│   ├── context_manager.py · conversation_memory.py · session_store.py · conversation_store.py
+│   ├── context_budget.py      per-prompt token accounting + priority-aware SQL budget
+│   ├── context_policy.py      per-field merge actions, follow-up kinds, provenance, rewrite checks
+│   ├── session_sync.py        cross-worker conversation state via app.conversations
+│   ├── followups.py           deterministic "next step" chips
+│   ├── premise_check.py       checks numbers asserted in the question against the result
+│   ├── cache.py · semantic_cache.py   response caches + metrics counters
+│   ├── auth.py · security.py · deps.py · appdb.py · net.py · asr_guard.py
+│   ├── users.yaml             one-time seed for app.users
+│   ├── routers/               query, auth, history, rag, admin
+│   └── middleware/            security headers, body limit, rate limit
+├── web/                       served UI (vanilla HTML/JS; Chart.js vendored)
+├── data/                      SME inputs read at startup: data/<scheme>/*.yaml + README,
+│                              data/reference/*.md (KB), data/web/*.md (KB), data/schema/
+├── docs/                      project documentation (this folder)
+├── deploy/                    nginx (+ ModSecurity CRS), systemd unit, SQL role/retention scripts
+├── tests/                     regression tests (pytest + plain scripts)
+├── Dockerfile, docker-compose.yml, requirements.txt, requirements.lock, .env.example
+└── certs/, logs/, archive/    gitignored contents (CA bundle, audit JSONL, rotated .env)
 ```
 
-The app VMs hold no state. Restarting either is safe; the KB re-ingest on
-startup is idempotent (skips when Qdrant already holds the chunks).
+`nlp-service/` exists in the working tree but is empty and untracked (VERIFIED). Its purpose is
+UNKNOWN.
 
----
+`app/` resolves `data/` and `web/` as siblings (`Path(__file__).resolve().parents[1]`), so the
+tree shape must be kept intact.
 
-## Routing — Edge → SQL → RAG
+## 2. Runtime topology
 
-`backend/pipeline.py::answer_question()`:
+```
+browser ──HTTPS──► nginx (per app VM; TLS, WAF, rate zones)       deploy/nginx/nginx-nlpservice.conf
+                     │ proxy_pass http://127.0.0.1:8300 (single upstream, no stickiness)
+                     ▼
+                uvicorn app.main:app --workers 2                  deploy/systemd/megh-nlpservice.service
+                     ├─ asyncpg pool (10–30/worker) ─► PostgreSQL 18.4 megh_db   10.48.242.4:5432
+                     ├─ httpx AsyncClient ───────────► vLLM gateway             https://10.48.242.4/openai/v1
+                     ├─ AsyncQdrantClient ───────────► Qdrant                   http://10.48.242.4:6333
+                     └─ fastembed (CPU, in-process) — bge-small-en-v1.5 embeddings
+```
 
-1. **Edge** (`edge.py`) — greetings, "who are you", thanks, off-topic, abuse.
-   Regex only, no model call. Returns `route:"edge"`.
-2. **Intent** (`classify_intent`) — keyword fast-path, else one classifier call.
-   `DATA` (a number from `megh_db`) vs `KNOWLEDGE` (how the scheme works).
-3. **KNOWLEDGE** → `rag.answer_from_kb()` — embed → Qdrant search → qwen3-reranker
-   → confidence tiers (return top chunk / compose from chunks / "not covered").
-   `route:"knowledge"`.
-4. **DATA** → the existing NL→SQL path: **scheme gate** (`_needs_scheme_clarification` —
-   `SCHEME_CLARIFY_ENABLED`; if the question names no scheme, asks for no cross-scheme
-   view, and uses no scheme-specific vocabulary, raise `ClarificationNeeded` with
-   one-tap `options` instead of guessing "both") → **top-N gate**
-   (`_needs_topn_clarification` — `TOPN_CLARIFY_ENABLED`; a ranked list over a dimension
-   with no count) → `classify_scheme` → `resolve_entities`
-   (deterministic; raises `ClarificationNeeded` when ambiguous) → **scope gate**
-   (`_needs_scope_clarification` — `SCOPE_CLARIFY_ENABLED`; an aggregate question that
-   pins no place *and* no year, free-text reply merged back in) → **year gate**
-   (`_needs_year_clarification` — `YEAR_CLARIFY_ENABLED`; a metric/breakdown question
-   whose place is already settled but which names no financial year and asks for no
-   time series — offers the scheme's FYs + "all years combined" as one-tap `options`) →
-   `execute_with_repair` (one repair retry) → **premise check** (`premise_check.check_premises`
-   — `PREMISE_CHECK_ENABLED`; a quantity the question asserts as fact, e.g. "the 1.71 L
-   sanctioned houses", is matched against the ≤3-row result — a note is added only when *no*
-   returned figure is close to it, so the composer won't restate an unsupported number) →
-   `compose_response` (told to not report a fabricated 0/NULL for a metric the schema
-   doesn't carry, and to correct any premise a note flags). `route:"data"`.
-   A `ClarificationNeeded` is returned as `intent:"CLARIFY"` + `clarification.options`
-   (plus the flat `needs_clarification`/`question` keys); the frontend renders the
-   options as clickable replies that each resume the flow as a standalone question.
-5. **Fallback** — a hard DATA failure tries the KB once before returning an
-   honest "couldn't answer that from the current data".
+- **VERIFIED from the config and deploy files.** The target is two application VMs, each running
+  nginx + systemd.
+- **The VM hardware (from the earlier version of this doc, not verifiable from code):** ESDS VMs,
+  24 vCores and 256 GB RAM each. VM #1 has 2× H200 GPUs, which this service does not use.
+- **UNKNOWN — NEEDS VERIFICATION:** whether production is live, and whether the Docker path or
+  the systemd path is used.
+- **VERIFIED:** `docker-compose.yml` binds `127.0.0.1:8301:8300` and has an optional
+  `local-infra` profile (Qdrant + Redis).
 
-Every generated statement is re-checked in `db.py` (`SELECT`/`WITH` only, single
-statement, no DDL/DML keywords) regardless of the DB role.
+## 3. Components
 
-**Follow-ups.** With an `X-Session-Id` header, `session_store.py` keeps the last
-few turns per worker (TTL `SESSION_TTL_SECONDS`). When turn *n*+1 reads like a
-fragment (`looks_like_followup` — a lead like "what about…", a bare pronoun, or a
-short anchorless phrase), `rewrite_followup` spends one classifier call to turn it
-into a standalone question using turn *n*, then routes that. The rewrite is
-returned as `rewritten_question`. Caches are bypassed whenever a session id or
-`X-User-Id` is present (a follow-up's meaning is context-dependent; a scoped
-answer must not be served to another role).
+For each component: its purpose, where it lives, its entry point, what it depends on, its input
+and output, and how it fails.
 
-The rewrite only fires when turn *n* was an actual scheme answer (`route` in
-`data` / `knowledge`) — a fragment after a greeting, off-topic reply,
-clarification or denial has nothing coherent to attach to. A fragment with a
-bare pronoun ("how launched it?") and no scheme named, arriving with no such
-antecedent, returns a short "name the scheme and what you'd like to know" nudge
-instead of being guessed into a query. Toggle: `FOLLOWUP_REWRITE_ENABLED`.
+### 3.1 App and lifecycle — `app/main.py` (VERIFIED)
+- **Entry point:** `app = FastAPI(...)`.
+- **Startup** (`lifespan`), in order:
+  1. secret guard (logs CRITICAL, never blocks);
+  2. `init_pool`;
+  3. `init_client`;
+  4. `init_qdrant`;
+  5. `load_annotations` and `load_entity_resolver` (local YAML);
+  6. `appdb.ensure_schema` (creates `app.*`, seeds users);
+  7. `schema_introspect.load` (the live schema catalogue);
+  8. `pipeline.refresh_scheme_years` (the per-scheme FY list from the DB);
+  9. a **background** `ingest_kb` task.
+- **Failure behaviour:** every remote step is wrapped in `_try`. The server always boots,
+  **degraded**. The DB pool rebuilds lazily on first use.
+- **Middleware order on the way in:**
+  1. rate limit;
+  2. body limit;
+  3. CORS (only when `CORS_ALLOW_ORIGINS` is set);
+  4. security headers (the outermost layer).
+- **Global exception handler:** returns `{"detail":"internal error","request_id":…}` and never
+  exposes stack traces.
+- **Static routes:** `/` (the portal), `/ai-query` (chat), `/admin-ui`, `/static/*`. These are
+  served `Cache-Control: no-cache`.
+- `/docs` and `/openapi.json` are only available when `ENV=dev`.
 
-**Edge handler (`edge.py`).** Rule-based, no model call, kept in step with the
-NeuralAI reference `edge_handler.py`. Order: (0) hard off-topic (weather,
-markets, sport) — wins even over a place name unless a scheme is named;
-(1) strong MGNREGA/PMAY-G intent → route it; (2) canned banks — greeting,
-identity, thanks, goodbye, profanity, silly, confused; (3) meta-conversation
-("what did I ask?") → pass through; (4) follow-up fragments ("add them up",
-"which is higher", "explain that") → pass through so the follow-up rewrite can
-handle them; (5) ≥3 non-ASCII chars → pass through (model reads Khasi/Garo/
-Bengali/Hindi); (6) domain whitelist — a question with **no** MGNREGA/PMAY-G
-vocabulary at all is answered as `off_topic` here, so it never reaches a model.
-Edge replies that redirect carry `suggestions` (`edge.STARTERS`) as one-tap
-chips.
+### 3.2 API routes (VERIFIED from `app/routers/*`)
 
-**Next-step suggestions.** After any data/knowledge answer, `followups.py`
-(`build_followups`, pure Python, no model call) attaches up to three
-`follow_up_options` `[{label, question}]` — the complementary metric for the
-same scheme and scope, a one-level-finer breakdown (state→district→block→
-village, from the resolved entities), and the rules/data counterpart. Every
-suggestion is a real question this service can answer; the bank is keyed on
-scheme + which metric words the question used + which entities resolved, so it
-never drifts into invented metrics. Edge replies instead carry `suggestions`
-(the `edge.STARTERS` starter questions) as one-tap chips. Toggle:
-`FOLLOWUP_SUGGEST_ENABLED`.
+| Route | Auth | Purpose |
+|---|---|---|
+| `POST /api/query` | user JWT | `{question, session_id?}` → answer JSON (§4) |
+| `POST /api/query/transcribe` | user JWT | multipart audio (≤10 MB) → `{text}` or `{text:"", no_speech:true}` |
+| `POST /api/auth/login` · `/logout` · `GET /me` · `POST /bootstrap` | – / user | username+password → HS256 JWT; bootstrap first super_admin |
+| `GET /api/history` · `GET/PATCH/DELETE /api/history/{session_id}` · `POST …/pin` · `…/archive` | user | officer-private chat history |
+| `GET /api/rag/status` · `POST /api/rag/reingest` | user / admin | KB point count; rebuild the KB |
+| `GET/POST /admin/tenants`, `/admin/roles`, `/admin/users[/{id}]` (CRUD), `/admin/logins`, `/admin/conversations[/{id}]`, `/admin/audit`, `/admin/stats`, `/admin/schema` | admin JWT (tenant-scoped) | admin console API |
+| `GET /health` | anonymous gets `{status}` only; admin JWT or `X-Metrics-Token` gets components | DB + Qdrant (+ Redis) status |
+| `GET /metrics` | admin JWT or `X-Metrics-Token` | route counts, latency percentiles, cache stats |
 
----
+**There is no WebSocket, SSE or streaming endpoint** (VERIFIED: nothing in `app/` or `web/`
+matches `websocket` or `StreamingResponse`).
 
-## Auth, multi-tenancy, authorization
+### 3.3 Query router — `app/routers/query.py` (VERIFIED)
+- **Input:** `QueryRequest`. The question is 1–2000 characters, with C0 control characters
+  stripped. `session_id` is optional and must match `^[A-Za-z0-9._:-]+$` (max 128).
+- **Steps:**
+  1. `_identity` requires a JWT when `AUTH_ENABLED`.
+  2. Session id: the client's, else `day-<uid>-<date>`, else `one-<random>`.
+  3. `session_store.ensure`. A fresh in-process session rehydrates its `ConversationState` from
+     Postgres.
+  4. If the question is not a follow-up fragment:
+     - try the exact cache, then the semantic cache;
+     - both are keyed on question + `scope.cache_fingerprint()`.
+  5. `answer_question` runs under `asyncio.wait_for(REQUEST_TIMEOUT_SECONDS=60)`.
+  6. Record the L1 turn.
+  7. Fire-and-forget: `persist_turn`, `conversation_memory.index_turn`, `save_context_state`.
+  8. JSONL audit mirror.
+  9. Cache write-back.
+  10. Metrics.
+- **Error mapping:**
 
-**Everything this service owns lives in the `app` schema of `megh_db`** (created
-idempotently at startup by `appdb.ensure_schema()`): `tenants`, `users`,
-`login_events`, `conversations`, `conversation_turns`, `query_audit`. The
-`curated`/`semantic` warehouse stays read-only.
+  | Exception | Result |
+  |---|---|
+  | `ClarificationNeeded` | 200 with `route:"clarification"`; stores `session.pending_scope_q` **in process** |
+  | `ModelBusyError` | 503 + `Retry-After: 5` |
+  | `DatabaseUnavailableError` (megh_db unreachable mid-question: VPN / network drop, lost connection) | 503 + `Retry-After: 5`, "Couldn't reach the Megh One data service…" (KI-025, 2026-09-28) |
+  | `asyncio.TimeoutError` (the 60 s ceiling, or a re-raised DB `command_timeout`) | 504 |
+  | `UnsafeSQLError` | 500. **Effectively unreachable:** the repair loop catches it and, once the budget is spent, `_run_pipeline` routes it to the KB fallback (AI_PIPELINE §2.8) |
+  | anything else (e.g. an `httpx` timeout or 5xx re-raised from the pipeline) | 502 |
 
-### Identity — `backend/security.py`, `routers/auth.py`, `deps.py`
-Officers authenticate with **username + password** (`POST /api/auth/login`).
-Passwords are PBKDF2-HMAC-SHA256 (stdlib, 200k iters, per-user salt). Login
-returns a **self-contained HS256 JWT** (`sub`, `username`, `tenant_id`, `role`,
-`exp`); `/api/query` and every `/api/*`/`/admin/*` route require it as
-`Authorization: Bearer`. `POST /api/auth/bootstrap` creates the first
-`super_admin` while `app.users` is empty (or with `ADMIN_TOKEN` after).
-`GET /api/auth/me`, `POST /api/auth/logout` (advisory — logged). Login/logout/
-fail/bootstrap all write `app.login_events` (admin-visible).
+### 3.4 Pipeline — `app/pipeline.py`
+The routing and NL→SQL chain. It is documented stage by stage in
+[AI_PIPELINE.md](AI_PIPELINE.md). Public entry points: `answer_question`,
+`looks_like_followup`, `ClarificationNeeded`, `_empty_data_fields`.
 
-### Multi-tenancy — department = tenant
-Every user belongs to one **tenant** (a directorate/department; default `RD`,
-seeded). `tenant_admin` manages users + sees conversations/audit **for their
-tenant only**; `super_admin` (`cross_tenant`) spans all tenants and creates them.
-Every conversation, turn and audit row is stamped `tenant_id`, and admin reads
-are filtered by it — one department can't see another's officers or chats.
+### 3.5 LLM client — `app/llm.py` (VERIFIED)
+- **Client:** one shared `httpx.AsyncClient`.
+- **Concurrency:** a per-worker `asyncio.Semaphore(MODEL_MAX_CONCURRENCY=24)`. Waiting longer
+  than `MODEL_QUEUE_TIMEOUT_SECONDS=20` raises `ModelBusyError`.
+- **Request shape:**
+  - `/chat/completions` with a **single `user` message** (no system prompt);
+  - `chat_template_kwargs.enable_thinking=False`;
+  - optional `guided_json` / `guided_regex`.
+  - If the gateway returns 400/404/422 to a guided request, the call is retried once without the
+    guided fields.
+- **TLS:** uses the `AI_MODEL_CA_BUNDLE_PATH` file if it exists. Otherwise it **falls back to
+  `verify=False`** and logs a warning (commit `5c5a100`).
+- **Role wrappers:** `call_classifier`, `call_sql_generator`, `call_sql_verifier`,
+  `call_response_composer`, `call_embedding`, `call_reranker`, `call_asr`.
 
-### Authorization — spec 5.7, `backend/auth.py`
-`scope_from_user(row)` builds a `UserScope` from `ROLE_PERMISSIONS[role]` narrowed
-(never widened) by the user's `districts`/`blocks`/`schemes`. After SQL
-generation, before execution, `authorize()` runs three checks on the generated
-SQL + resolved entities:
+### 3.6 Database access — `app/db.py` (VERIFIED)
+- **`init_pool` / `ensure_pool`:** the asyncpg pool, with `command_timeout` =
+  `SQL_EXECUTION_TIMEOUT_MS/1000` (15 s).
+- **`run_readonly(sql)`:** the only path for LLM SQL. `_assert_safe` enforces:
+  - no `;` inside the statement;
+  - a `select`/`with` first word;
+  - no `insert|update|delete|drop|alter|create|truncate|grant|revoke|copy|vacuum` anywhere.
 
-| Check | Denies when |
+  It appends `LIMIT 1000` if the substring "limit" is absent.
+- **`fetch_rows`, `fetchrow`, `fetchval`, `execute`, `execute_script`:** for the app's own
+  parameter-bound SQL only.
+
+### 3.7 Authentication and authorization (VERIFIED)
+- **`security.py`:**
+  - PBKDF2-HMAC-SHA256 (200k iterations);
+  - HS256 JWT with `sub`, `username`, `tenant_id`, `role`, `exp`, issuer check;
+  - TTL of `JWT_TTL_MINUTES=720`.
+- **`deps.py`:** `current_scope`, `require_user`, `require_admin`, `require_super`.
+- **`auth.py`:**
+  - `ROLE_PERMISSIONS`: `super_admin`, `tenant_admin`, `admin`, `state_officer`,
+    `district_officer`, `block_officer`, `analyst`, `public`. Every role lists all six schemes.
+  - `scope_from_user` narrows a role by the user's own districts, blocks and schemes.
+  - `authorize(scope, schemes, resolved_entities, sql)` runs **after SQL generation, before
+    execution**. It checks scheme, geography and granularity (state < district < block < village)
+    using regexes over the SQL. Admin roles bypass these checks. A deny returns `route:"denied"`.
+- **Multi-tenancy:** every conversation, turn and audit row carries `tenant_id`, and admin reads
+  are filtered by `_tenant_filter`.
+- **Known gap:** the geography regex only recognises `lgd_district`/`lgd_block` (KNOWN_ISSUES
+  KI-007).
+
+### 3.8 Conversation state (VERIFIED)
+- **L1 — `session_store.py`:**
+  - in-process and per worker, with a TTL (`SESSION_TTL_SECONDS=1800`);
+  - up to 8 turns;
+  - holds `pending_scope_q` / `pending_village_hint` / `pending_scope_rule` /
+    `pending_scope_options`: the clarification-resume state, which is **not persisted** (KI-001);
+  - each `Turn` carries `result_summary`, the deterministic row summary used as follow-up
+    evidence;
+  - since 2026-09-26 this is only a per-worker **cache**. `session_sync.sync_in` refreshes it
+    from Postgres on every request, and `sync_out` writes it back awaited (KI-028 / KI-001,
+    D-023).
+- **L2 — `conversation_store.py`:** Postgres `app.conversations` and `app.conversation_turns`.
+  Turn and audit writes are fire-and-forget via `asyncio.create_task`.
+  - `context_state` (JSONB) holds the versioned session snapshot: state, provenance, last turn,
+    pending clarification, recent questions and `rev`. It is the source of truth for
+    conversation state, written by the awaited, revision-guarded `save_session_state`.
+  - It also holds the rolling `summary`.
+- **`context_manager.py`:** deterministic reference substitution, scheme-hint injection, merged
+  prior entities, the follow-up context window, the follow-up evidence tiers
+  (`build_rewrite_evidence`; AI_PIPELINE.md §5.1, D-022) and a periodic summary. State commits
+  only on a successful DATA turn.
+- **`context_policy.py`:** the per-field merge actions, follow-up kinds, provenance and
+  field-specific rewrite checks (AI_PIPELINE.md §5.4, D-024).
+- **`session_sync.py`:** cross-worker state (AI_PIPELINE.md §5.5, D-023).
+- **`conversation_memory.py`:** semantic memory of older turns in the Qdrant collection
+  `megh_conversation_memory`. It is used only when the in-process session has fewer than 2
+  turns.
+
+### 3.9 RAG and knowledge base (VERIFIED)
+- **`kb_ingest.py`:**
+  - chunks the `_SOURCES` docs (10 SME docs in `data/reference/`) plus tagged `data/web/*.md`;
+  - embeds them;
+  - on startup, recreates the Qdrant collection `megh_scheme_kb` if it is missing, too small, or
+    missing any scheme (`vectorstore.distinct_schemes`).
+- **`rag.py`:**
+  - `retrieve` searches Qdrant with an **exact-match** `scheme` payload filter;
+  - `answer_from_kb` answers in tiers: top score ≥ 0.84 → the chunk verbatim; ≥ 0.55 → composed
+    by the 9B; below that → "not covered";
+  - `answer_from_kb_multi` retrieves per scheme.
+- **CM Elevate Legacy** reads CM Elevate's KB (`_KB_SCHEME_ALIAS`).
+- **The reranker is disabled** (`RERANKER_ENABLED=False`).
+
+### 3.10 Caches and metrics (VERIFIED)
+- **`cache.py`:**
+  - exact-match LRU (TTL 900 s, 2,000 entries), with an optional Redis L2 (`REDIS_URL`);
+  - the `metrics` counters.
+- **`semantic_cache.py`:** in-process cosine cache (threshold 0.93, TTL 900 s, 1,000 entries),
+  which reuses the pipeline's embedding.
+- **Neither cache** stores clarifications or follow-up fragments.
+
+### 3.11 Frontend — `web/` (VERIFIED)
+- `ai_query.html` (about 4,160 lines), the chat console:
+  - calls `/api/query`, `/api/query/transcribe`, `/api/history*` and `/api/auth/*`;
+  - keeps the JWT in `localStorage` (`megh_jwt`);
+  - renders clarification chips, follow-up chips, charts (Chart.js, vendored) and tables.
+- `admin.html`: the admin SPA.
+- `Meghalaya_UnifiedPortal_UI.html`: the portal landing page.
+- There is no build step, no framework and no client-side router.
+- `ai_query.html` accepts an optional **`?api=<base-url>`** query parameter (`API_BASE`), which
+  prefixes every API call.
+  - The default is same-origin.
+  - A cross-origin base is blocked by the enforced CSP (`connect-src 'self'`) unless CSP and
+    CORS are changed.
+  - The `PRODUCTS` object is a leftover of the per-scheme era. It now holds a single
+    `unified_auto` entry.
+- The greeting text lists all six schemes, but a code comment above `PRODUCTS` still says
+  "Scheme selection (MGNREGA / PMAY-G / both)". Cosmetic, and stale.
+
+### 3.13 Unused code in `data/` (VERIFIED)
+`data/cm_elevate/prompt_assembler.py` and `data/focus_plus/prompt_assembler.py` are tracked in
+git but **imported by nothing** in `app/` or `tests/`. They are SME-side artefacts. Do not assume
+they affect prompts; the live prompt is built by `app/prompt_builder.py`.
+
+### 3.12 Security middleware — `app/middleware/` (VERIFIED)
+- `security_headers.py`:
+  - CSP (`'unsafe-inline'` is kept for the inline JS);
+  - HSTS, nosniff, frame-deny, referrer and permissions policies;
+  - `X-Request-ID`.
+- `limits.py`: a 256 KB body cap. The transcribe route is exempt and has its own 10 MB cap.
+- `rate_limit.py`: per-IP sliding window. `/api/auth/login` allows 6 per 300 s; `/api/query*`
+  allows 30 per 60 s. The backend is `memory` by default, or `redis`.
+- The full OWASP map is in [SECURITY.md](SECURITY.md).
+
+## 4. `/api/query` response shape (VERIFIED)
+
+Every route carries `route`, `intent`, `answer`, `session_id`, `execution_time_ms` and the empty
+data fields `schemes`, `resolved_entities`, `sql`, `sql_query`, `row_count`, `rows`, `data`.
+
+| `route` | Extra fields |
 |---|---|
-| **scheme** | the question needs a scheme not in `scope.schemes` |
-| **geography** | a district/block literal (or resolved entity) isn't in the user's assigned area — or a geo-restricted user asks a district+-grain question with no area named |
-| **granularity** | the query grain (`state < district < block < village`, from GROUP BY / entities) is finer than `scope.granularity_cap` |
+| `data` | `confidence`, `rows` (the first 20), `data` (all rows, ≤1000), `follow_up_options`, `rewritten_question?` |
+| `knowledge` | `confidence`, `sources`, `follow_up_options` |
+| `edge` | `edge_type`, `suggestions` |
+| `clarification` | `needs_clarification`, `question`, `clarification:{options, rule}` |
+| `denied` | `denied_by` (`scheme`/`geography`/`granularity`) |
 
-Deny ⇒ `route:"denied"`, `denied_by:"<check>"`, plain-English `answer`, no SQL
-run. **Admin roles bypass the three checks** (5.7 targets officers, not admins)
-but stay tenant-scoped for what they can *see*. Roles: `super_admin`,
-`tenant_admin`, `admin`, `state_officer` (district cap), `district_officer` /
-`block_officer` (area-pinned), `analyst` (unrestricted read), `public` (state cap).
+## 5. Data stores
 
-### Conversations + audit — `backend/conversation_store.py`
-`session_store.py` is the in-process L1 for follow-up context; this module is the
-durable L2 (fire-and-forget writes, DB outage ⇒ answer still returns). A client
-`session_id`/`X-Session-Id` continues a conversation; with none, an officer's
-ad-hoc questions roll into one `day-<uid>-<date>` conversation. Officer-private:
-`GET /api/history` and `/api/history/{session_id}` filter by the caller's
-`user_id` — one officer can never read another's chats.
-
-### Admin API — `routers/admin.py` (admin JWT; `_tenant_filter` scopes every read)
-`GET/POST/PATCH/DELETE /admin/users`, `GET /admin/users/{id}` (effective scope),
-`GET /admin/roles`, `GET/POST /admin/tenants` (POST = super_admin),
-`GET /admin/logins`, `GET /admin/conversations` + `/{conv_id}`,
-`GET /admin/audit?denied_only=&user_id=`, `GET /admin/stats`, `GET /admin/schema`.
-A JSONL mirror of the audit trail is still written to `AUDIT_FILE`.
-
-### Admin dashboard — `frontend/admin.html`, served at `/admin-ui`
-Single-page vanilla JS: login gate → tabs for Overview (stats + recent logins),
-Users (create/deactivate/reset-pw with role + district/scheme scope), Login
-events, Conversations (per-officer, drill into turns + SQL), Query audit (filter
-denied), Tenants (super_admin), Schema catalog. JWT kept in `localStorage`.
-
----
-
-## Embeddings + reranker
-
-Gateway deployments confirmed: `qwen-model` (SQL), `qwen35-9b` (classify/compose),
-**`qwen3-reranker`** (`/openai/v1/rerank`, its own key). **No** embedding or ASR
-model. So `EMBEDDING_PROVIDER=local`: `fastembed` runs `BAAI/bge-small-en-v1.5`
-(384-dim ONNX) on one dedicated worker thread for KB ingest + query/semantic-cache
-embeddings; `llm.call_reranker` now calls the real `qwen3-reranker` and only falls
-back to classifier scoring if that route errs. Flip `EMBEDDING_PROVIDER=gateway`
-once `qwen3-embedding` is deployed. With the real reranker in place
-`RAG_HIGH_CONFIDENCE` is raised to 0.80 so near-miss retrieval is corrected by the
-composer instead of returned verbatim.
-
-## Live schema catalog — `backend/schema_introspect.py`
-
-At startup, reads `semantic.table_catalog` / `glossary` / `metric_definitions` /
-`join_graph` from `megh_db` and folds a compact, scheme-scoped "LIVE CATALOG"
-block (table descriptions, business-term → column mappings, metric formulas) into
-the SQL-generation prompt alongside the hand-written hazard rules in
-`schema_context.py`. `GET /admin/schema` returns the loaded catalog. Toggle with
-`SCHEMA_CATALOG_ENABLED`.
-
----
-
-## Capacity — 20–40 concurrent, ~200 DAU
-
-### The load
-
-- **200 DAU**, ~5–15 questions each over the working day ≈ **1,000–3,000 questions/day**.
-- Peak **20–40 truly concurrent** in-flight requests.
-- Split (observed shape): ~15% edge (no model call), ~25% knowledge/RAG, ~60% data/SQL.
-
-### What each request costs
-
-| Route | Model calls | ~Wall time |
+| Store | What | Owner |
 |---|---|---|
-| edge | 0 | < 50 ms |
-| data | 1–4 (classify + intent often short-circuit via keyword/`_shortcut_scheme`; SQL-gen + compose always) → avg ~2.5 | 4–9 s |
-| knowledge | embed + rerank + (0–1 compose) → avg ~2 | 2–5 s |
-| **exact-cache hit (any route)** | 0 | < 20 ms |
-| **semantic-cache hit (any route)** | 1 (embed only) | ~50–150 ms |
+| `megh_db.curated` / `semantic` | Scheme data (read-only to this app) | ingestion team |
+| `megh_db.app` | `tenants`, `users`, `login_events`, `conversations`, `conversation_turns`, `query_audit` | this app (`appdb.ensure_schema`) |
+| Qdrant `megh_scheme_kb` | KB chunks (384-dim bge-small) | this app |
+| Qdrant `megh_conversation_memory` | past-turn vectors per tenant/user/session | this app |
+| `logs/query_audit.jsonl` | JSONL audit mirror (questions, IPs) | this app (gitignored) |
+| `ASR_DEBUG_DIR` (e.g. `logs/asr_samples`) | **every voice upload saved as WAV plus its transcript** when set. It is set in the local dev `.env` (VERIFIED, 2026-09-26); diagnostics only | this app (gitignored under `logs/`) |
 
-At 40 concurrent that is up to ~100 simultaneous model calls if unbounded — which the shared 30B cannot absorb. So the app **bounds and sheds** instead.
+**DB roles.**
+- `deploy/sql/01_create_megh_app_role.sql` creates `megh_app` with SELECT on
+  `curated`/`semantic`, and **SELECT/INSERT/UPDATE/DELETE + CREATE on `app`**.
+- The **local dev `.env` connects as `postgres`** (VERIFIED, 2026-09-26).
+- Which role production uses is UNKNOWN — NEEDS VERIFICATION. See KI-004.
 
-### The controls (all in `config.py` / `.env`)
+## 6. Configuration
 
-| Control | Setting | Effect |
+- All settings are in [app/config.py](../app/config.py) and can be overridden by `.env`.
+  `.env.example` lists about 94 keys.
+- `.env` is read relative to the working directory, so run from the repo root. It is gitignored
+  and holds secrets.
+- The systemd unit deliberately does **not** use `EnvironmentFile=`, because inline `#` comments
+  would break parsing.
+- **Feature toggles** (all `True` unless noted):
+  - Clarification gates: `SCHEME_CLARIFY_ENABLED`, `TOPN_…`, `SCOPE_…`, `YEAR_…`,
+    `TRANCHE_CLARIFY_ENABLED`.
+  - Guards: `OUT_OF_SCOPE_GUARD_ENABLED`, `PREMISE_CHECK_ENABLED`, `YEAR_RANGE_GUARD_ENABLED`,
+    `SQL_VERIFY_ENABLED`.
+  - Context layer: `CONTEXT_*`.
+  - Follow-ups: `FOLLOWUP_REWRITE_ENABLED`, `FOLLOWUP_SUGGEST_ENABLED`.
+  - Decoding: `GUIDED_DECODING_ENABLED`, `SQL_GUIDED_DECODING_ENABLED`.
+  - Other: `SCHEMA_CATALOG_ENABLED`.
+  - `RERANKER_ENABLED` is **False**.
+
+## 7. Logging, error handling and observability (VERIFIED)
+
+- Logging: the stdlib `logging` format `time | level | name | message`.
+  - Pipeline log lines carry **no request id, user or question**. The exception is the
+    `prompt_context` line per model prompt (`app/context_budget.py`): section token sizes,
+    budget and `request_id`, taken from `X-Request-ID` via a contextvar set in
+    `middleware/security_headers.py`. It contains no prompt text.
+  - `llm_call` lines, one per model call: role, model, queue ms, latency ms, and the gateway's
+    `prompt_tokens` / `completion_tokens`.
+  - The SQL of a failed attempt is **not logged** (KI-003).
+- Audit: `app.query_audit` (DB) plus the `logs/query_audit.jsonl` mirror.
+  - Recorded: user, tenant, role, route, schemes, granularity, allow/deny, row count, IP,
+    latency.
+  - **Not recorded: the SQL.**
+- `app.conversation_turns` stores the final SQL and the response JSON.
+- `/metrics`: `requests_by_route` (including `:cache` and `:semcache`), latency p50/p95/p99,
+  `busy_rejections_total`, `errors_total`, and cache and session stats.
+- Degradation is silent, logged only as warnings:
+  - a verifier failure is treated as "no issue";
+  - a schema-catalogue load failure falls back to the hand-written prompt;
+  - context-layer failures are ignored.
+
+## 8. Capacity (from config; design target 20–40 concurrent users, about 200 DAU)
+
+| Control | Setting |
+|---|---|
+| Model concurrency | 24 slots per worker; 2 workers × 2 VMs = 96 cluster-wide (INFERRED from the deploy files) |
+| Load shed | 20 s queue wait → 503 |
+| Request ceiling | 60 s → 504 (nginx `proxy_read_timeout` 120 s) |
+| DB pool | 10–30 per worker; statement timeout 15 s; ≤1000 rows |
+| Caches | exact 15 min; semantic 15 min at cosine 0.93 |
+
+- **Model calls per DATA request** (from `TECHNICAL_BRIEF.md` §1.2, derived from the code path):
+  best case 3, typical 4–6, worst case about 13.
+- **Scaling risks** (per-worker state, per-IP rate limit behind NAT, prompt size): see
+  KNOWN_ISSUES.
+
+## 9. External services and infrastructure
+
+| Service | Where | Notes |
 |---|---|---|
-| Model-gateway concurrency cap | `MODEL_MAX_CONCURRENCY=24` (`llm.py` semaphore) | ≤ 24 in-flight model calls per worker; the rest queue. vLLM continuous-batching handles ~24 concurrent decodes on an H200 without latency collapse. |
-| Load shedding | `MODEL_QUEUE_TIMEOUT_SECONDS=20` | A call that can't get a slot in 20 s → `ModelBusyError` → **HTTP 503 + `Retry-After: 5`**. Fail fast, don't pile up. |
-| Response cache | `RESPONSE_CACHE_ENABLED`, `RESPONSE_CACHE_TTL_SECONDS=900`, `RESPONSE_CACHE_MAX_ENTRIES=2000` (`cache.py`) | Exact-match (normalised) repeated questions skip the pipeline entirely — 0 model calls. Per-worker, 15-min TTL so a DB reload shows within 15 min. Expect 20–40% hit rate in steady state. |
-| Semantic cache | `SEMANTIC_CACHE_ENABLED`, `SEMANTIC_CACHE_THRESHOLD=0.93`, `SEMANTIC_CACHE_TTL_SECONDS=900`, `SEMANTIC_CACHE_MAX_ENTRIES=1000` (`semantic_cache.py`) | Catches near-duplicates the exact-match cache misses ("houses in EGH" vs "…East Garo Hills"). Costs **1 embedding call** on an otherwise-uncached question to save the 2–4 chat calls a pipeline run makes; the pipeline reuses that embedding. Embedding failure → plain miss. Excludes edge / low-confidence / clarification results. |
-| Guided decoding | `GUIDED_DECODING_ENABLED`, `SQL_GUIDED_DECODING_ENABLED` (`llm.py` + `pipeline.py` schemas) | `guided_json` on the scheme / entity / intent classifier calls, `guided_regex` (bare `SELECT`/`WITH`) on SQL-gen. Removes the "unusable JSON → slow fallback" path and trims ````sql`-fence / prose-preamble repair round-trips. Sent as extra fields on the vLLM body; `_extract_json` / `_extract_sql` still run, so a gateway that ignores them is unaffected. Not a SQL grammar — won't catch a wrong join. |
-| Per-request ceiling | `REQUEST_TIMEOUT_SECONDS=60` (enforced in router via `asyncio.wait_for`) | A stuck request → **HTTP 504**, slot freed. |
-| Rate limit | 30 req / min / IP on `/api/query*` (`middleware/rate_limit.py`) | Per-worker sliding window; blunt abuse guard. |
-| PG pool | `DB_POOL_MIN_SIZE=10`, `DB_POOL_MAX_SIZE=30` | Connections held only for the ~15 ms–15 s execute step, never across model calls — 30 covers 40 concurrent since most requests are in the model-call phase. |
-| SQL guards | `SQL_EXECUTION_TIMEOUT_MS=15000`, `SQL_MAX_RESULT_ROWS=1000`, auto-`LIMIT` | One slow/huge query can't monopolise a pool slot. |
+| vLLM model gateway | `https://10.48.242.4/openai/v1` | self-signed "Enlight AIOps" CA; microk8s/KServe (per `docs/INFERENCE_REQUIREMENTS.md`) |
+| PostgreSQL 18.4 `megh_db` | `10.48.242.4:5432` | shared box; pgAdmin on :8080 |
+| Qdrant | `10.48.242.4:6333` | shared collection `megh_scheme_kb` |
+| Redis | optional (`REDIS_URL`) | blank in local `.env`; production value UNKNOWN |
 
-### Headroom
+The `10.48.242.4` host requires the office Fortinet VPN from dev machines (source: earlier
+session notes, not verifiable from code).
 
-- 2 workers/VM × 2 VMs = **4 event loops × 24 slots = 96** model-call slots cluster-wide, against a 20–40 concurrent target → ~2–4× headroom before shedding starts.
-- CPU per worker is light (async I/O, no local inference). Memory per worker < 300 MB + cache (~a few MB at 2,000 entries).
-- The real ceiling is the model gateway's own throughput — watch `nvidia-smi` / vLLM metrics on `10.48.242.4`, not the app VMs.
+## 10. Deployment
 
-### Watch it
+See [deploy/DEPLOYMENT.md](../deploy/DEPLOYMENT.md): Python 3.11, venv, `.env`, the systemd unit,
+nginx, ModSecurity CRS (staged `DetectionOnly` → `On`), DB role and retention scripts, and a
+go-live checklist.
 
-`GET /metrics` → `requests_by_route` (incl. `<route>:cache` and `<route>:semcache`), `latency_ms_p95/p99`, `busy_rejections_total`, `errors_total`, `response_cache.hit_rate`, `semantic_cache.{hit_rate,embed_errors}`. If `busy_rejections_total` climbs, either raise `MODEL_MAX_CONCURRENCY` (if the gateway has room) or add a model replica. If `latency_ms_p95` for `data` exceeds ~12 s, the 30B is the bottleneck — add prefix caching + n-gram speculative decoding on its vLLM server, or a second replica.
+- The Docker build uses `requirements.txt`, not the lock file, because the lock pins
+  Windows-only packages.
+- No PM2 and no AWS appear in the repo (VERIFIED).
 
-**Inference-engine techniques — split of where each lives.** Client-side (done, in this service): guided/structured decoding (above). vLLM server flags on `10.48.242.4` (not code — need config access to that box): `--enable-prefix-caching` (every SQL-gen call shares the scoped schema-context prefix), `--speculative-model=[ngram]` (SQL output echoes table/column/district literals straight from the prompt), chunked prefill (keeps a long SQL-gen prefill from head-of-line-blocking short classify calls), `--kv-cache-dtype fp8` (raises the concurrency ceiling without touching weight precision). Weight quantisation is already FP8 — do not push to INT4/AWQ given the "output must be good" constraint.
+## 11. Component dependency graph (VERIFIED imports, simplified)
 
-Worst-case single-request latency ≈ classify + intent + SQL-gen + compose (each ≤ 30 s cap) + one PG round trip; nginx `proxy_read_timeout` 120 s and the app's 60 s ceiling both sit above that, so the app — not nginx — returns the clean 504.
-
----
-
-## Model roster (`.env` / `config.py`)
-
-| Role | Model | Where |
-|---|---|---|
-| Scheme + intent classify, SQL generation | `qwen-model` (qwen3-coder-30b-fp8) | gateway `/chat/completions` |
-| Answer composition | `qwen35-9b` | gateway `/chat/completions` |
-| KB chunk + query embeddings | `qwen3-embedding` | gateway `/embeddings` |
-| KB candidate reranking | `qwen3-reranker` | gateway `/rerank` (falls back to prompt-scoring) |
-| Voice input | `qwen3-asr` | gateway `/audio/transcriptions` |
+```
+routers/query ─► pipeline ─► edge, context_manager, followups, premise_check, rag, auth
+                    │
+                    ├─► prompt_builder ─► schema_context, schema_introspect, annotations
+                    ├─► entity_resolver ─► db (villages/AC live), data/*/…entity_resolver.yaml
+                    ├─► llm (all model roles)
+                    └─► db.run_readonly
+rag ─► vectorstore (Qdrant), local_embed/llm.call_embedding
+routers/query ─► cache, semantic_cache, session_store, conversation_store, conversation_memory
+main ─► appdb, schema_introspect, annotations, entity_resolver, kb_ingest, db, llm, vectorstore
+```

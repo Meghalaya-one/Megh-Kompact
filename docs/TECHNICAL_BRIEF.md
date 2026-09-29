@@ -1,5 +1,21 @@
 # Megh One AI (nlp-service): Technical Brief
 
+> **Historical snapshot (2026-09-24). Not maintained.** Its findings have been migrated into the
+> maintained docs:
+> - [ARCHITECTURE.md](ARCHITECTURE.md)
+> - [AI_PIPELINE.md](AI_PIPELINE.md)
+> - [DATA_MODEL.md](DATA_MODEL.md)
+> - [KNOWN_ISSUES.md](KNOWN_ISSUES.md)
+>
+> Known drift since it was written:
+> - Line numbers are stale: `pipeline.py` has grown from 7,587 lines to about 8,400.
+> - `_AC_CAPABLE_SCHEMES` now also includes CM Elevate Legacy.
+> - Verifier false-positive filters: 8, not 6.
+> - Test counts are now 558 pytest cases and 14 scripts.
+> - The "ARCHITECTURE.md describes two schemes" finding was fixed on 2026-09-26.
+>
+> Keep this file for its log-derived evidence (§4), which was not re-measured.
+
 *State of the working tree as of 2026-09-24 (branch `main`, including uncommitted changes).*
 *Built by reading the code, running the test suite and mining `logs/`. No code was changed.*
 

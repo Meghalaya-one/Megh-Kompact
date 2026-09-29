@@ -8,16 +8,21 @@ from fastapi import (APIRouter, Depends, File, Form, HTTPException,
                      Request, UploadFile)
 from pydantic import BaseModel, Field, field_validator
 
-from app import asr_guard, auth, conversation_memory, conversation_store, llm
+from app import (asr_guard, auth, context_manager, conversation_memory, conversation_store, llm,
+                 session_sync)
 from app.cache import metrics, response_cache
 from app.config import settings
 from app.deps import current_scope, require_user
 from app.net import client_ip as _resolve_ip
 from app.semantic_cache import semantic_cache
-from app.session_store import ConversationState, Turn, session_store
-from app.db import UnsafeSQLError
+from app.session_store import Turn, session_store
+from app.db import DatabaseUnavailableError, UnsafeSQLError
 from app.llm import ModelBusyError
 from app.pipeline import (
+    SCHEME_PAUSE_RULES,
+    SCOPE_MERGE_RULES,
+    is_scheme_substitution,
+    is_scopeless_followup,
     ClarificationNeeded,
     _empty_data_fields,
     answer_question,
@@ -80,23 +85,16 @@ async def query(req: QueryRequest, request: Request,
         session_id = f"one-{uuid.uuid4().hex[:16]}"
     session = session_store.ensure(session_id, scope.user_id)
     session.scope = scope
-    # Rehydrate the L1 structured state from its L2 (Postgres) mirror when this
-    # is a fresh in-process session resuming an existing, client-named thread —
-    # a worker restart, a session that TTL'd out of session_store, or a request
-    # landing on a different worker. Only on a session with no turns yet, so a
-    # live conversation's in-process state (the source of truth while it's
-    # active) is never clobbered mid-thread. Best-effort: any failure just
-    # means this turn starts with blank state, same as before this layer existed.
-    if not session.turns and client_session:
-        try:
-            durable = await conversation_store.load_context_state(session_id)
-            if durable.get("context_state"):
-                session.state = ConversationState.from_dict(durable["context_state"])
-            if durable.get("summary"):
-                session.summary = durable["summary"]
-                session.summary_turn_count = session.state.turn_count
-        except Exception as e:  # noqa: BLE001
-            logger.warning("context state rehydration failed (non-fatal): %s", e)
+    # Shared conversation state (app/session_sync.py, KI-028): bring this
+    # worker's copy up to the durable revision before answering. The previous
+    # request may have been served by another worker (2 workers on each of 2 VMs,
+    # no stickiness), and its turn, state and pending clarification are only
+    # current in app.conversations. Bounded and non-raising: if the DB is
+    # unreachable the local copy is used, as before. A one-off "one-..." id has
+    # no durable thread to read.
+    durable_session = not session_id.startswith("one-")
+    if durable_session:
+        await session_sync.sync_in(session, session_id)
 
     # Response + semantic caches are keyed on (question + authorization
     # fingerprint): safe to share across users who resolve to the same scope,
@@ -104,7 +102,13 @@ async def query(req: QueryRequest, request: Request,
     # follow-up fragments ("what about EGH?") are never cached — they only mean
     # something against their own conversation.
     scope_key = scope.cache_fingerprint()
-    cacheable = not looks_like_followup(req.question)
+    # A reply to a pending clarification ("Focus Plus", "West Garo Hills
+    # 2023-24") only means something against the question it resumes. Served
+    # from the shared cache it would return whatever was cached for those bare
+    # words, and written back it would poison the cache for everyone else. A
+    # scope fragment usually already looked like a follow-up; a bare scheme
+    # name does not.
+    cacheable = is_cacheable(req.question, session)
     sem_vec = None
     result = None
     served_from = None  # metrics route tag when the answer came from a cache
@@ -133,10 +137,7 @@ async def query(req: QueryRequest, request: Request,
             # the answer as free text ("West Garo Hills 2023-24", "East Khasi
             # Hills"). Remember the question so the pipeline merges that reply back
             # into it next turn instead of treating it as a brand-new question.
-            if e.rule in ("scope-not-specified", "year-not-specified", "entity-ambiguous",
-                         "ranking-count-not-specified"):
-                session.pending_scope_q = req.question
-                session.pending_village_hint = e.village_hint
+            remember_pause(session, pause_question(session, req.question), e)
             # Shape it for the frontend clarification renderer (intent CLARIFY +
             # clarification.options), and keep the flat keys older callers read.
             out = {
@@ -162,10 +163,23 @@ async def query(req: QueryRequest, request: Request,
                 username=scope.username or None, ip=ip,
             )
             _mirror_audit(scope, session_id, req.question, {"route": "clarification"}, started, ip)
+            # The pending clarification must reach whichever worker receives the
+            # reply (KI-001): it is part of the durable snapshot.
+            if durable_session:
+                await session_sync.sync_out(session, session_id, tenant_id=scope.tenant_id,
+                                            user_id=scope.db_user_id, title=req.question)
             return out
         except ModelBusyError as e:
             metrics.busy_rejections += 1
             raise HTTPException(503, "The service is busy right now. Please retry in a few seconds.",
+                                headers={"Retry-After": "5"}) from e
+        except DatabaseUnavailableError as e:
+            # megh_db unreachable mid-question (VPN / network drop). Say so, so
+            # the officer retries — never a "not in the data" answer (KI-025).
+            metrics.errors += 1
+            logger.warning("database unreachable: %s", e)
+            raise HTTPException(503, "Couldn't reach the Megh One data service just now (network or "
+                                     "VPN interruption). Please retry in a few seconds.",
                                 headers={"Retry-After": "5"}) from e
         except asyncio.TimeoutError as e:
             metrics.errors += 1
@@ -188,14 +202,7 @@ async def query(req: QueryRequest, request: Request,
 
     # L1 follow-up context — recorded even on a cache hit, so the next turn's
     # follow-up rewrite still has this question as its antecedent.
-    session_store.add_turn(session_id, Turn(
-        question=result.get("rewritten_question") or req.question,
-        raw_question=req.question,
-        route=result.get("route", "data"),
-        schemes=result.get("schemes", []),
-        resolved_entities=result.get("resolved_entities", {}),
-        answer=result.get("answer", ""),
-    ))
+    session_store.add_turn(session_id, build_turn(req.question, result))
     # L2 durable — conversation + turn + audit (fire-and-forget)
     conversation_store.persist_turn(
         tenant_id=scope.tenant_id, user_id=scope.db_user_id, session_id=session_id,
@@ -211,12 +218,13 @@ async def query(req: QueryRequest, request: Request,
         question=req.question, standalone_question=result.get("rewritten_question") or req.question,
         answer=result.get("answer", ""), schemes=result.get("schemes"),
     )
-    # L2 mirror of the structured conversation state (context_manager.update_state
-    # already ran, in-process, inside answer_question). Runs after persist_turn
-    # above so the app.conversations row it needs is guaranteed to exist,
-    # including on this session's very first turn.
-    conversation_store.save_context_state(
-        session_id=session_id, context_state=session.state.to_dict())
+    # Durable snapshot of this turn: structured state, this turn as the next
+    # follow-up's antecedent, the summary. AWAITED, because the next request can
+    # land on another worker immediately (session_sync.sync_out upserts the row
+    # itself, so it no longer races persist_turn's insert).
+    if durable_session:
+        await session_sync.sync_out(session, session_id, tenant_id=scope.tenant_id,
+                                    user_id=scope.db_user_id, title=req.question)
     _mirror_audit(scope, session_id, req.question, result, started, ip)
 
     # Only write back a freshly computed answer, and only under this caller's scope.
@@ -226,6 +234,101 @@ async def query(req: QueryRequest, request: Request,
 
     metrics.record(served_from or result.get("route", "data"), latency_ms)
     return result
+
+
+# ── Per-request conversation bookkeeping ────────────────────────────────────
+# Module-level so the live validation harness (tests/live_context_validation.py)
+# runs exactly this logic rather than a copy of it.
+
+def is_cacheable(question: str, session) -> bool:
+    """Whether this request may be served from, and written to, the shared
+    answer caches. Follow-up fragments only mean something within their own
+    conversation. So does a reply to a pending clarification ("Focus Plus",
+    "West Garo Hills 2023-24"): served from the cache it would return whatever
+    was cached for those words, and written back it would poison the cache
+    for everyone else. A bare "Focus Plus" or "West Garo Hills 2023-24"
+    already looked like a follow-up. "focus plus please" or "for the district
+    of West Garo Hills in the year 2023-24" did not, and were cacheable
+    (checked 2026-09-26)."""
+    if getattr(session, "pending_scope_q", None) or looks_like_followup(question):
+        return False
+    # A measure-only question right after a data answer ("How many beneficiaries
+    # were there?") is answered in that turn's scope, so it must not be cached
+    # for anyone else (pipeline.is_scopeless_followup).
+    prev = getattr(session, "last_turn", None)
+    # Likewise a scheme substitution ("give me the same for MGNREGA in 2023-24"):
+    # its scope is the previous turn's (pipeline.is_scheme_substitution).
+    return not (is_scopeless_followup(question, prev) or is_scheme_substitution(question, prev))
+
+
+def pause_question(session, raw_question: str) -> str:
+    """The question to remember for a pause. A reply that resumed an earlier
+    pause and then paused AGAIN is remembered as the full resumed question
+    (pipeline turn_context["resumed_question"]), never the bare reply: a typed
+    "Focus Plus" resumed the bank question, the area pause that followed was
+    remembered as just "Focus Plus", and the typed "All of Meghalaya" then ran
+    as "Focus Plus, All of Meghalaya" (Focus Plus use-case QA 2026-09-27).
+    A follow-up that paused is remembered as its standalone form
+    (turn_context["standalone_question"]): "give me beneficiaries" rewritten
+    "…under CM Elevate Legacy" and paused for the year; remembered as the bare
+    fragment, the typed "2024-25" resumed without the scheme (2026-09-29)."""
+    ctx = getattr(session, "turn_context", None) or {}
+    return ctx.get("standalone_question") or ctx.get("resumed_question") or raw_question
+
+
+def remember_pause(session, question: str, e: ClarificationNeeded) -> None:
+    """Remember a clarification pause so the next turn's reply resumes it.
+    The pending fields are part of the durable snapshot (session_sync), so
+    the reply may land on any worker."""
+    if e.rule in SCOPE_MERGE_RULES:
+        # A scope pause ("which area / year?"), a year pause ("which FY?"), or
+        # an entity-ambiguity pause ("which of these villages/districts/blocks?")
+        # carries one-tap options where they exist, but the user may still type
+        # the answer as free text ("West Garo Hills 2023-24", "East Khasi
+        # Hills"). Remember the question so the pipeline merges that reply back
+        # into it next turn instead of treating it as a brand-new question.
+        session.pending_scope_q = question
+        session.pending_village_hint = e.village_hint
+        session.pending_scope_rule = e.rule
+        session.pending_scope_options = None
+    elif e.rule in SCHEME_PAUSE_RULES:
+        # "Which scheme?" / "which Focus?": remember the options too, so a
+        # TYPED scheme name resumes the paused question as its chip would
+        # (pipeline._resume_scheme_pause). Any other reply is unaffected.
+        session.pending_scope_q = question
+        session.pending_village_hint = None
+        session.pending_scope_rule = e.rule
+        session.pending_scope_options = list(e.options or [])
+    elif e.rule and e.options:
+        # Any other pause that offers chips ("PMAY-G doesn't record person-days
+        # — which of its measures?", "which FY?", "which tranche?", "which
+        # Sericulture scheme?"): remember the options, so a TYPED pick ("houses
+        # sanctioned", "2022-23", "the second one") resumes it as its chip
+        # would, and an unmatched reply continues the paused scheme's thread
+        # (pipeline._resume_option_pause / _paused_thread_antecedent). Before
+        # 2026-09-29 these pauses were forgotten and a typed reply continued the
+        # last ANSWERED turn instead.
+        session.pending_scope_q = question
+        session.pending_village_hint = None
+        session.pending_scope_rule = e.rule
+        session.pending_scope_options = list(e.options)
+
+
+def build_turn(question: str, result: dict) -> Turn:
+    """The L1 follow-up context for an answered request. It is recorded even on
+    a cache hit, so the next turn's follow-up rewrite still has this question
+    as its antecedent."""
+    return Turn(
+        question=result.get("rewritten_question") or question,
+        raw_question=question,
+        route=result.get("route", "data"),
+        schemes=result.get("schemes", []),
+        resolved_entities=result.get("resolved_entities", {}),
+        answer=result.get("answer", ""),
+        # Structured evidence for a later "what about the top one?" —
+        # see context_manager.build_rewrite_evidence (never raises).
+        result_summary=context_manager.summarize_result(result),
+    )
 
 
 def _mirror_audit(scope, session_id, question, result, started, ip):
